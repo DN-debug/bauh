@@ -40,20 +40,20 @@ class DependenciesAnalyser:
             output.append((name, 'aur'))
             return
 
-        aur_search = self.aur_client.search(name)
-
-        if aur_search:
-            aur_search_info = self.aur_client.get_info((aur_res['Name'] for aur_res in aur_search['results']))
-
-            if aur_search_info:
-                for aur_pkg in aur_search_info:
-                    aur_pkg_name = aur_pkg['Name']
-                    if aur_pkg_name == name or ('Provides' in aur_pkg and name in aur_pkg['Provides']):
-                        output.append((aur_pkg_name, 'aur'))
-                        if name != aur_pkg_name:
-                            self._log.warning(f"Package '{name}' repository could not be determined (not found neither in repositories nor in AUR). "
-                                              f"But AUR package '{aur_pkg_name}' provides '{name}' and will be considered")
-                        return
+        # aur_search = self.aur_client.search(name)
+        #
+        # if aur_search:
+        #     aur_search_info = self.aur_client.get_info((aur_res['Name'] for aur_res in aur_search['results']))
+        #
+        #     if aur_search_info:
+        #         for aur_pkg in aur_search_info:
+        #             aur_pkg_name = aur_pkg['Name']
+        #             if aur_pkg_name == name or ('Provides' in aur_pkg and name in aur_pkg['Provides']):
+        #                 output.append((aur_pkg_name, 'aur'))
+        #                 if name != aur_pkg_name:
+        #                     self._log.warning(f"Package '{name}' repository could not be determined (not found neither in repositories nor in AUR). "
+        #                                       f"But AUR package '{aur_pkg_name}' provides '{name}' and will be considered")
+        #                 return
 
         output.append((name, ''))
 
@@ -273,32 +273,58 @@ class DependenciesAnalyser:
             repo_deps.add(dep_data[0])
             missing_deps.add(dep_data)
 
-        elif aur_index and dep_name in aur_index:
-            if dep_name == dep_exp:
-                aur_deps.add(dep_name)
-                missing_deps.add((dep_name, 'aur'))
-            else:
-                dep_info = self.aur_client.get_info({dep_name})
-
-                if not dep_info:
-                    self.__raise_dependency_not_found(dep_exp, watcher)
+        elif aur_index:
+            if dep_name in aur_index:
+                if dep_name == dep_exp:
+                    aur_deps.add(dep_name)
+                    missing_deps.add((dep_name, 'aur'))
                 else:
-                    try:
-                        dep_version = dep_info[0]['Version']
-                    except:
-                        traceback.print_exc()
-                        return self.__raise_dependency_not_found(dep_exp, watcher)
+                    dep_info = self.aur_client.get_info({dep_name})
 
-                    split_informed_dep = self.re_dep_operator.split(dep_exp)
-                    try:
+                    if not dep_info:
+                        self.__raise_dependency_not_found(dep_exp, watcher)
+                    else:
+                        try:
+                            dep_version = dep_info[0]['Version']
+                        except:
+                            traceback.print_exc()
+                            return self.__raise_dependency_not_found(dep_exp, watcher)
+
+                        split_informed_dep = self.re_dep_operator.split(dep_exp)
+                        try:
+                            version_required = split_informed_dep[2]
+                            exp_op = split_informed_dep[1].strip()
+
+                            if match_required_version(dep_version, exp_op, version_required):
+                                aur_deps.add(dep_name)
+                                missing_deps.add((dep_name, 'aur'))
+                        except:
+                            self.__raise_dependency_not_found(dep_exp, watcher)
+            else:
+                aur_search = self.aur_client.search(dep_name)
+
+                if aur_search:
+                    aur_search_info = self.aur_client.get_info((aur_res['Name'] for aur_res in aur_search['results']))
+
+                    if aur_search_info:
+                        split_informed_dep = self.re_dep_operator.split(dep_exp)
                         version_required = split_informed_dep[2]
                         exp_op = split_informed_dep[1].strip()
 
-                        if match_required_version(dep_version, exp_op, version_required):
-                            aur_deps.add(dep_name)
-                            missing_deps.add((dep_name, 'aur'))
-                    except:
-                        self.__raise_dependency_not_found(dep_exp, watcher)
+                        for aur_pkg in aur_search_info:
+                            aur_pkg_name = aur_pkg['Name']
+                            if aur_pkg_name == dep_name or ('Provides' in aur_pkg and dep_name in aur_pkg['Provides']):
+                                try:
+                                    if match_required_version(aur_pkg['Version'], exp_op, version_required):
+                                        aur_deps.add(dep_name)
+                                        missing_deps.add((dep_name, 'aur'))
+                                        return
+                                except:
+                                    self._log.warning(f"Could not compare AUR package '{aur_pkg_name}' version '{aur_pkg['Version']}' with"
+                                                    f" the dependency '{dep_name}' expression '{dep_exp}'")
+                                    traceback.print_exc()
+
+                self.__raise_dependency_not_found(dep_exp, watcher)
         else:
             self.__raise_dependency_not_found(dep_exp, watcher)
 
