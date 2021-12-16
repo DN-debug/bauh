@@ -195,9 +195,6 @@ class DependenciesAnalyser:
     def _fill_missing_repo_dep(self, dep_name: str, dep_exp: str, missing_deps: Set[Tuple[str, str]],
                                remote_provided_map: Dict[str, Set[str]], remote_repo_map: Dict[str, str],
                                repo_deps: Set[str], deps_data: Dict[str, dict], automatch_providers: bool) -> bool:
-        if dep_name in ('wine', 'winetricks'):  # FIXME remove (just for testing)
-            return False
-
         if dep_name == dep_exp:
             providers = remote_provided_map.get(dep_name)
 
@@ -278,7 +275,8 @@ class DependenciesAnalyser:
 
     def _fill_missing_aur_dep(self, dep_name: str, dep_exp: str, aur_index: Iterable[str],
                               missing_deps: Set[Tuple[str, str]], aur_deps: Set[str],
-                              automatch_providers: bool) -> bool:
+                              remote_provided_map: Dict[str, Set[str]],
+                              remote_repo_map: Dict[str, str], automatch_providers: bool) -> bool:
         if dep_name in aur_index:
             if dep_name == dep_exp:
                 aur_deps.add(dep_name)
@@ -344,6 +342,16 @@ class DependenciesAnalyser:
                         if len(aur_providers) > 1:
                             aur_deps.add(dep_name)
                             missing_deps.add((dep_name, '__several__'))
+
+                            # updating the remote providers available
+                            for key in {dep_name, dep_exp}:
+                                current_providers = remote_provided_map.get(key, set())
+                                current_providers.update(aur_providers)
+                                remote_provided_map[key] = current_providers
+
+                            for provider in aur_providers:
+                                if provider not in remote_repo_map:
+                                    remote_repo_map[provider] = 'aur'
                         else:
                             aur_deps.add(aur_providers[0])
                             missing_deps.add((aur_providers[0], 'aur'))
@@ -375,7 +383,10 @@ class DependenciesAnalyser:
                                        repo_deps=repo_deps, deps_data=deps_data, automatch_providers=automatch_providers):
             return
         elif aur_index and self._fill_missing_aur_dep(dep_name=dep_name, dep_exp=dep_exp, aur_index=aur_index,
-                                                      missing_deps=missing_deps, aur_deps=aur_deps, automatch_providers=automatch_providers):
+                                                      missing_deps=missing_deps, aur_deps=aur_deps,
+                                                      automatch_providers=automatch_providers,
+                                                      remote_provided_map=remote_provided_map,
+                                                      remote_repo_map=remote_repo_map):
             return
         else:
             self.__raise_dependency_not_found(dep_exp, watcher)
@@ -467,8 +478,17 @@ class DependenciesAnalyser:
                         deps_data.update(data)
 
             if aur_missing:
+                aur_single_providers = []
+
+                for d in missing_deps:
+                    if d[0] in aur_missing and d[0] not in deps_data:
+                        if d[1] == '__several__':
+                            deps_data[d[0]] = {'d': None, 'p': d[0], 'r': d[1]}
+                        else:
+                            aur_single_providers.append(d[0])
+
                 aur_threads = []
-                for pkgname in aur_missing:
+                for pkgname in aur_single_providers:
                     t = Thread(target=self.__fill_aur_update_data, args=(pkgname, deps_data), daemon=True)
                     t.start()
                     aur_threads.append(t)
@@ -524,12 +544,17 @@ class DependenciesAnalyser:
                                        remote_provided_map)
 
         if deps_providers:
-            all_providers = set()
+            providers_repos = {}
+            repos_providers = set()
 
             for providers in deps_providers.values():
-                all_providers.update(providers)
+                for provider in providers:
+                    if remote_repo_map.get(provider) == 'aur':
+                        providers_repos[provider] = 'aur'
+                    else:
+                        repos_providers.update(providers)
 
-            providers_repos = pacman.map_repositories(all_providers)
+            providers_repos.update(pacman.map_repositories(repos_providers))
             selected_providers = confirmation.request_providers(deps_providers, providers_repos, watcher, self.i18n)
 
             if not selected_providers:
