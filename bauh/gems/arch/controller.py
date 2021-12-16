@@ -209,7 +209,7 @@ class ArchManager(SoftwareManager):
         self.enabled = True
         self.arch_distro = context.distro == 'arch'
         self.categories = {}
-        self.deps_analyser = DependenciesAnalyser(self.aur_client, self.i18n)
+        self.deps_analyser = DependenciesAnalyser(self.aur_client, self.i18n, self.logger)
         self.http_client = context.http_client
         self._custom_actions: Optional[Dict[str, CustomSoftwareAction]] = None
         self.index_aur = None
