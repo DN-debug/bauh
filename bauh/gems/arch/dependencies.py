@@ -197,8 +197,9 @@ class DependenciesAnalyser:
                           remote_provided_map: Dict[str, Set[str]], remote_repo_map: Dict[str, str],
                           repo_deps: Set[str], aur_deps: Set[str], deps_data: Dict[str, dict], watcher: ProcessWatcher,
                           automatch_providers: bool):
-
-        if dep_name == dep_exp:
+        if dep_name == 'winetricks':
+            providers = None
+        elif dep_name == dep_exp:
             providers = remote_provided_map.get(dep_name)
 
             if not providers:  # try to find the package through the pacman's search mechanism
@@ -338,6 +339,8 @@ class DependenciesAnalyser:
                             else:
                                 aur_deps.add(aur_providers[0])
                                 missing_deps.add((aur_providers[0], 'aur'))
+
+                            return
 
                 self.__raise_dependency_not_found(dep_exp, watcher)
         else:
