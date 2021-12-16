@@ -1,5 +1,6 @@
 import re
 import traceback
+from logging import Logger
 from threading import Thread
 from typing import Set, List, Tuple, Dict, Iterable, Optional
 
@@ -13,10 +14,11 @@ from bauh.view.util.translation import I18n
 
 class DependenciesAnalyser:
 
-    def __init__(self, aur_client: AURClient, i18n: I18n):
+    def __init__(self, aur_client: AURClient, i18n: I18n, logger: Logger):
         self.aur_client = aur_client
         self.i18n = i18n
         self.re_dep_operator = re.compile(r'([<>=]+)')
+        self._log = logger
 
     def _fill_repository(self, name: str, output: List[Tuple[str, str]]):
 
@@ -45,14 +47,18 @@ class DependenciesAnalyser:
 
             if aur_search_info:
                 for aur_pkg in aur_search_info:
-                    if aur_pkg['Name'] == name or ('Provides' in aur_pkg and name in aur_pkg['Provides']):
-                        output.append((aur_pkg['Name'], 'aur'))
+                    aur_pkg_name = aur_pkg['Name']
+                    if aur_pkg_name == name or ('Provides' in aur_pkg and name in aur_pkg['Provides']):
+                        output.append((aur_pkg_name, 'aur'))
+                        if name != aur_pkg_name:
+                            self._log.warning(f"Package '{name}' repository could not be determined (not found neither in repositories nor in AUR). "
+                                              f"But AUR package '{aur_pkg_name}' provides '{name}' and will be considered")
                         return
 
         output.append((name, ''))
 
-    def get_missing_packages(self, names: Set[str], repository: str = None, in_analysis: Set[str] = None) -> List[
-        Tuple[str, str]]:
+    def get_missing_packages(self, names: Set[str], repository: Optional[str] = None, in_analysis: Optional[Set[str]] = None) -> \
+            List[Tuple[str, str]]:
         """
         :param names:
         :param repository:
