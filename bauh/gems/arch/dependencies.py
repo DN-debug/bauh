@@ -38,6 +38,17 @@ class DependenciesAnalyser:
             output.append((name, 'aur'))
             return
 
+        aur_search = self.aur_client.search(name)
+
+        if aur_search:
+            aur_search_info = self.aur_client.get_info((aur_res['Name'] for aur_res in aur_search['results']))
+
+            if aur_search_info:
+                for aur_pkg in aur_search_info:
+                    if aur_pkg['Name'] == name or ('Provides' in aur_pkg and name in aur_pkg['Provides']):
+                        output.append((aur_pkg['Name'], 'aur'))
+                        return
+
         output.append((name, ''))
 
     def get_missing_packages(self, names: Set[str], repository: str = None, in_analysis: Set[str] = None) -> List[
