@@ -194,8 +194,10 @@ class DependenciesAnalyser:
 
     def _fill_missing_repo_dep(self, dep_name: str, dep_exp: str, missing_deps: Set[Tuple[str, str]],
                                remote_provided_map: Dict[str, Set[str]], remote_repo_map: Dict[str, str],
-                               repo_deps: Set[str], deps_data: Dict[str, dict], watcher: ProcessWatcher,
-                               automatch_providers: bool):
+                               repo_deps: Set[str], deps_data: Dict[str, dict], automatch_providers: bool) -> bool:
+        if dep_name in ('wine', 'winetricks'):  # FIXME remove (just for testing)
+            return False
+
         if dep_name == dep_exp:
             providers = remote_provided_map.get(dep_name)
 
@@ -276,22 +278,23 @@ class DependenciesAnalyser:
 
     def _fill_missing_aur_dep(self, dep_name: str, dep_exp: str, aur_index: Iterable[str],
                               missing_deps: Set[Tuple[str, str]], aur_deps: Set[str],
-                              watcher: ProcessWatcher, automatch_providers: bool):
+                              automatch_providers: bool) -> bool:
         if dep_name in aur_index:
             if dep_name == dep_exp:
                 aur_deps.add(dep_name)
                 missing_deps.add((dep_name, 'aur'))
+                return True
             else:
                 dep_info = self.aur_client.get_info({dep_name})
 
                 if not dep_info:
-                    self.__raise_dependency_not_found(dep_exp, watcher)
+                    return False
                 else:
                     try:
                         dep_version = dep_info[0]['Version']
                     except:
                         traceback.print_exc()
-                        return self.__raise_dependency_not_found(dep_exp, watcher)
+                        return False
 
                     split_informed_dep = self.re_dep_operator.split(dep_exp)
                     try:
@@ -301,8 +304,9 @@ class DependenciesAnalyser:
                         if match_required_version(dep_version, exp_op, version_required):
                             aur_deps.add(dep_name)
                             missing_deps.add((dep_name, 'aur'))
+                            return True
                     except:
-                        self.__raise_dependency_not_found(dep_exp, watcher)
+                        return False
         else:
             aur_search = self.aur_client.search(dep_name)
 
@@ -326,14 +330,14 @@ class DependenciesAnalyser:
                                 if not version_required or match_required_version(aur_pkg['Version'], exp_op,
                                                                                   version_required):
                                     if automatch_providers and same_name:
-                                        aur_deps.add(dep_name)
-                                        missing_deps.add((dep_name, 'aur'))
+                                        aur_deps.add(aur_pkg_name)
+                                        missing_deps.add((aur_pkg_name, 'aur'))
+                                        return True
                                     else:
                                         aur_providers.append(aur_pkg_name)
                             except:
-                                self._log.warning(
-                                    f"Could not compare AUR package '{aur_pkg_name}' version '{aur_pkg['Version']}' with"
-                                    f" the dependency '{dep_name}' expression '{dep_exp}'")
+                                self._log.warning(f"Could not compare AUR package '{aur_pkg_name}' version '{aur_pkg['Version']}' "
+                                                  f"with the dependency expression '{dep_exp}'")
                                 traceback.print_exc()
 
                     if aur_providers:
@@ -344,9 +348,9 @@ class DependenciesAnalyser:
                             aur_deps.add(aur_providers[0])
                             missing_deps.add((aur_providers[0], 'aur'))
 
-                        return
+                        return True
 
-            self.__raise_dependency_not_found(dep_exp, watcher)
+            return False
 
     def _map_provided_by_aur_pkg(self, aur_pkg) -> Set[str]:
         all_provided = set()
@@ -368,13 +372,11 @@ class DependenciesAnalyser:
 
         if self._fill_missing_repo_dep(dep_name=dep_name, dep_exp=dep_exp, missing_deps=missing_deps,
                                        remote_provided_map=remote_provided_map, remote_repo_map=remote_repo_map,
-                                       repo_deps=repo_deps, deps_data=deps_data, watcher=watcher,
-                                       automatch_providers=automatch_providers):
+                                       repo_deps=repo_deps, deps_data=deps_data, automatch_providers=automatch_providers):
             return
-        elif aur_index:
-            self._fill_missing_aur_dep(dep_name=dep_name, dep_exp=dep_exp, aur_index=aur_index,
-                                       missing_deps=missing_deps, aur_deps=aur_deps, watcher=watcher,
-                                       automatch_providers=automatch_providers)
+        elif aur_index and self._fill_missing_aur_dep(dep_name=dep_name, dep_exp=dep_exp, aur_index=aur_index,
+                                                      missing_deps=missing_deps, aur_deps=aur_deps, automatch_providers=automatch_providers):
+            return
         else:
             self.__raise_dependency_not_found(dep_exp, watcher)
 
