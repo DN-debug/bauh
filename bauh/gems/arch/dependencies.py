@@ -321,7 +321,7 @@ class DependenciesAnalyser:
                     for aur_pkg in aur_search_info:
                         aur_pkg_name = aur_pkg['Name']
                         same_name = aur_pkg_name == dep_name
-                        if same_name or ('Provides' in aur_pkg and dep_name in aur_pkg['Provides']):
+                        if same_name or ('Provides' in aur_pkg and dep_name in self._map_provided_by_aur_pkg(aur_pkg)):
                             try:
                                 if not version_required or match_required_version(aur_pkg['Version'], exp_op,
                                                                                   version_required):
@@ -347,6 +347,18 @@ class DependenciesAnalyser:
                         return
 
             self.__raise_dependency_not_found(dep_exp, watcher)
+
+    def _map_provided_by_aur_pkg(self, aur_pkg) -> Set[str]:
+        all_provided = set()
+        all_provided.add(aur_pkg['Name'])
+        all_provided.add(f"{aur_pkg['Name']}={aur_pkg['Version']}")
+
+        if aur_pkg['Provides']:
+            for provided in aur_pkg['Provides']:
+                all_provided.add(provided)
+                all_provided.add(provided.split('=', 1)[0])
+
+        return all_provided
 
     def _fill_missing_dep(self, dep_name: str, dep_exp: str, aur_index: Iterable[str],
                           missing_deps: Set[Tuple[str, str]],
