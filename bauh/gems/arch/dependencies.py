@@ -40,21 +40,6 @@ class DependenciesAnalyser:
             output.append((name, 'aur'))
             return
 
-        # aur_search = self.aur_client.search(name)
-        #
-        # if aur_search:
-        #     aur_search_info = self.aur_client.get_info((aur_res['Name'] for aur_res in aur_search['results']))
-        #
-        #     if aur_search_info:
-        #         for aur_pkg in aur_search_info:
-        #             aur_pkg_name = aur_pkg['Name']
-        #             if aur_pkg_name == name or ('Provides' in aur_pkg and name in aur_pkg['Provides']):
-        #                 output.append((aur_pkg_name, 'aur'))
-        #                 if name != aur_pkg_name:
-        #                     self._log.warning(f"Package '{name}' repository could not be determined (not found neither in repositories nor in AUR). "
-        #                                       f"But AUR package '{aur_pkg_name}' provides '{name}' and will be considered")
-        #                 return
-
         output.append((name, ''))
 
     def get_missing_packages(self, names: Set[str], repository: Optional[str] = None, in_analysis: Optional[Set[str]] = None) -> \
