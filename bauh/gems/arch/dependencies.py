@@ -307,18 +307,20 @@ class DependenciesAnalyser:
                     aur_search_info = self.aur_client.get_info((aur_res['Name'] for aur_res in aur_search['results']))
 
                     if aur_search_info:
+                        if dep_name == dep_exp:
+                            version_required, exp_op = None, None
+                        else:
+                            split_informed_dep = self.re_dep_operator.split(dep_exp)
+                            version_required = split_informed_dep[2]
+                            exp_op = split_informed_dep[1] if split_informed_dep[1] != '=' else '=='
+
                         aur_providers = []
-
-                        split_informed_dep = self.re_dep_operator.split(dep_exp)
-                        version_required = split_informed_dep[2]
-                        exp_op = split_informed_dep[1].strip()
-
                         for aur_pkg in aur_search_info:
                             aur_pkg_name = aur_pkg['Name']
                             same_name = aur_pkg_name == dep_name
                             if same_name or ('Provides' in aur_pkg and dep_name in aur_pkg['Provides']):
                                 try:
-                                    if match_required_version(aur_pkg['Version'], exp_op, version_required):
+                                    if not version_required or match_required_version(aur_pkg['Version'], exp_op, version_required):
                                         if automatch_providers and same_name:
                                             aur_deps.add(dep_name)
                                             missing_deps.add((dep_name, 'aur'))
