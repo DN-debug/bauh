@@ -307,22 +307,35 @@ class DependenciesAnalyser:
                     aur_search_info = self.aur_client.get_info((aur_res['Name'] for aur_res in aur_search['results']))
 
                     if aur_search_info:
+                        aur_providers = []
+
                         split_informed_dep = self.re_dep_operator.split(dep_exp)
                         version_required = split_informed_dep[2]
                         exp_op = split_informed_dep[1].strip()
 
                         for aur_pkg in aur_search_info:
                             aur_pkg_name = aur_pkg['Name']
-                            if aur_pkg_name == dep_name or ('Provides' in aur_pkg and dep_name in aur_pkg['Provides']):
+                            same_name = aur_pkg_name == dep_name
+                            if same_name or ('Provides' in aur_pkg and dep_name in aur_pkg['Provides']):
                                 try:
                                     if match_required_version(aur_pkg['Version'], exp_op, version_required):
-                                        aur_deps.add(dep_name)
-                                        missing_deps.add((dep_name, 'aur'))
-                                        return
+                                        if automatch_providers and same_name:
+                                            aur_deps.add(dep_name)
+                                            missing_deps.add((dep_name, 'aur'))
+                                        else:
+                                            aur_providers.append(aur_pkg_name)
                                 except:
                                     self._log.warning(f"Could not compare AUR package '{aur_pkg_name}' version '{aur_pkg['Version']}' with"
-                                                    f" the dependency '{dep_name}' expression '{dep_exp}'")
+                                                      f" the dependency '{dep_name}' expression '{dep_exp}'")
                                     traceback.print_exc()
+
+                        if aur_providers:
+                            if len(aur_providers) > 1:
+                                aur_deps.add(dep_name)
+                                missing_deps.add((dep_name, '__several__'))
+                            else:
+                                aur_deps.add(aur_providers[0])
+                                missing_deps.add((aur_providers[0], 'aur'))
 
                 self.__raise_dependency_not_found(dep_exp, watcher)
         else:
