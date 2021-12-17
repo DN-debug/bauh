@@ -180,6 +180,9 @@ class DependenciesAnalyser:
     def _fill_missing_repo_dep(self, dep_name: str, dep_exp: str, missing_deps: Set[Tuple[str, str]],
                                remote_provided_map: Dict[str, Set[str]], remote_repo_map: Dict[str, str],
                                repo_deps: Set[str], deps_data: Dict[str, dict], automatch_providers: bool) -> bool:
+        if dep_name in ('wine', 'winetricks'):  # FIXME remove (just for testing)
+            return False
+
         if dep_name == dep_exp:
             providers = remote_provided_map.get(dep_name)
 
@@ -545,8 +548,8 @@ class DependenciesAnalyser:
             if not selected_providers:
                 return
             else:
-                providers_data = pacman.map_updates_data(
-                    selected_providers)  # adding the chosen providers to re-check the missing deps
+                # adding the chosen providers for re-checking the missing dependencies
+                providers_data = pacman.map_updates_data(selected_providers)
                 provided_map.update(pacman.map_provided(remote=True,
                                                         pkgs=selected_providers))  # adding the providers as "installed" packages
 
