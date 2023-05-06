@@ -15,7 +15,7 @@ from bauh.api.abstract.controller import SoftwareManager, SoftwareAction
 from bauh.api.abstract.handler import TaskManager
 from bauh.api import user
 from bauh.view.qt.components import new_spacer, QCustomToolbar
-from bauh.view.qt.qt_utils import centralize
+from bauh.view.qt.qt_utils import centralize, get_current_screen_geometry
 from bauh.view.qt.root import RootDialog
 from bauh.view.qt.thread import AnimateProgress
 from bauh.view.util.translation import I18n
@@ -145,17 +145,15 @@ class PreparePanel(QWidget, TaskManager):
     signal_status = pyqtSignal(int)
     signal_password_response = pyqtSignal(bool, str)
 
-    def __init__(self, context: ApplicationContext, manager: SoftwareManager, screen_size: QSize,
-                 i18n: I18n, manage_window: QWidget, app_config: dict):
+    def __init__(self, context: ApplicationContext, manager: SoftwareManager,
+                 i18n: I18n, manage_window: QWidget, app_config: dict, force_suggestions: bool = False):
         super(PreparePanel, self).__init__(flags=Qt.CustomizeWindowHint | Qt.WindowTitleHint)
         self.i18n = i18n
         self.context = context
         self.app_config = app_config
         self.manage_window = manage_window
         self.setWindowTitle('{} ({})'.format(__app_name__, self.i18n['prepare_panel.title.start'].lower()))
-        self.setMinimumWidth(int(screen_size.width() * 0.5))
-        self.setMinimumHeight(int(screen_size.height() * 0.35))
-        self.setMaximumHeight(int(screen_size.height() * 0.95))
+
         self.setLayout(QVBoxLayout())
         self.setSizePolicy(QSizePolicy.Minimum, QSizePolicy.Preferred)
         self.manager = manager
@@ -165,6 +163,7 @@ class PreparePanel(QWidget, TaskManager):
         self.ftasks = 0
         self.started_at = None
         self.self_close = False
+        self.force_suggestions = force_suggestions
 
         self.prepare_thread = Prepare(self.context, manager, self.i18n)
         self.prepare_thread.signal_register.connect(self.register_task)
@@ -290,7 +289,11 @@ class PreparePanel(QWidget, TaskManager):
     def show(self):
         super(PreparePanel, self).show()
         self.prepare_thread.start()
-        centralize(self)
+        screen_size = get_current_screen_geometry()
+        self.setMinimumWidth(int(screen_size.width() * 0.5))
+        self.setMinimumHeight(int(screen_size.height() * 0.35))
+        self.setMaximumHeight(int(screen_size.height() * 0.95))
+        centralize(self, align_top_left=False)
 
     def start(self, tasks: int):
         self.started_at = time.time()
@@ -438,7 +441,9 @@ class PreparePanel(QWidget, TaskManager):
         if self.isVisible():
             self.manage_window.show()
 
-            if self.app_config['boot']['load_apps']:
+            if self.force_suggestions:
+                self.manage_window.begin_load_suggestions(filter_installed=True)
+            elif self.app_config['boot']['load_apps']:
                 self.manage_window.begin_refresh_packages()
             else:
                 self.manage_window.load_without_packages()

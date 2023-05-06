@@ -30,7 +30,7 @@ CLI_NAME = f'{__app_name__}-cli'
 
 def get_cli_path() -> str:
     if os.getenv('APPIMAGE'):
-        return CLI_NAME
+        return f"{os.environ['APPRUN_STARTUP_EXEC_PATH']} {os.environ['APPDIR']}usr/bin/{CLI_NAME}"
 
     venv = os.getenv('VIRTUAL_ENV')
 
@@ -46,12 +46,12 @@ def get_cli_path() -> str:
             return cli_path
     else:
         return shutil.which(CLI_NAME)
-    
+
 
 def list_updates(logger: logging.Logger) -> List[PackageUpdate]:
     cli_path = get_cli_path()
     if cli_path:
-        exitcode, output = system.execute(f'{cli_path} updates -f json', custom_env=dict(os.environ))
+        exitcode, output = system.execute(f'{cli_path} updates -f json')
 
         if exitcode != 0:
             output_log = output.replace('\n', ' ') if output else ' '
@@ -79,16 +79,13 @@ class UpdateCheck(QThread):
         self.logger = logger
 
     def _notify_updates(self):
-        self.lock.acquire()
-        try:
+        with self.lock:
             updates = list_updates(self.logger)
 
             if updates is not None:
                 self.signal.emit(updates)
-        finally:
-            self.lock.release()
 
-        self.sleep(self.check_interval)
+        self.sleep(int(self.check_interval * 60))
 
     def run(self):
         while True:
@@ -97,7 +94,7 @@ class UpdateCheck(QThread):
                     self._notify_updates()
                     try:
                         os.remove(TRAY_CHECK_FILE)
-                    except:
+                    except Exception:
                         traceback.print_exc()
                 else:
                     self.sleep(self.check_interval)
@@ -179,7 +176,7 @@ class TrayIcon(QSystemTrayIcon):
         self.check_thread.signal.connect(self.notify_updates)
         self.check_thread.start()
 
-        self.recheck_thread = UpdateCheck(check_interval=2, check_file=True, lock=self.check_lock, logger=logger)
+        self.recheck_thread = UpdateCheck(check_interval=5, check_file=True, lock=self.check_lock, logger=logger)
         self.recheck_thread.signal.connect(self.notify_updates)
         self.recheck_thread.start()
 

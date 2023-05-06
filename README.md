@@ -1,9 +1,9 @@
-[![GitHub release](https://img.shields.io/github/release/vinifmor/bauh.svg?label=Release)](https://github.com/vinifmor/bauh/releases/) [![PyPI](https://img.shields.io/pypi/v/bauh?label=PyPI)](https://pypi.org/project/bauh) [![AUR](https://img.shields.io/aur/version/bauh?label=AUR)](https://aur.archlinux.org/packages/bauh) [![AUR-staging](https://img.shields.io/aur/version/bauh-staging?label=AUR-staging)](https://aur.archlinux.org/packages/bauh-staging) [![License](https://img.shields.io/github/license/vinifmor/bauh?label=License)](https://github.com/vinifmor/bauh/blob/master/LICENSE) [![kofi](https://img.shields.io/badge/Ko--Fi-Donate-orange?style=flat&logo=ko-fi)](https://ko-fi.com/vinifmor) [![Follow on Twitter](https://img.shields.io/twitter/follow/bauh4linux?style=social&label=Twitter)](https://twitter.com/bauh4linux)
+[![GitHub release](https://img.shields.io/github/release/vinifmor/bauh.svg?label=Release)](https://github.com/vinifmor/bauh/releases/) [![PyPI](https://img.shields.io/pypi/v/bauh?label=PyPI)](https://pypi.org/project/bauh) [![AUR](https://img.shields.io/aur/version/bauh?label=AUR)](https://aur.archlinux.org/packages/bauh) [![AUR-staging](https://img.shields.io/aur/version/bauh-staging?label=AUR-staging)](https://aur.archlinux.org/packages/bauh-staging) [![License](https://img.shields.io/github/license/vinifmor/bauh?label=License)](https://github.com/vinifmor/bauh/blob/master/LICENSE) [![kofi](https://img.shields.io/badge/Ko--Fi-Donate-orange?style=flat&logo=ko-fi)](https://ko-fi.com/vinifmor)
 
-**bauh** (ba-oo), formerly known as **fpakman**, is a graphical interface for managing your Linux software (packages/applications). It currently supports the following formats: AppImage, ArchLinux repositories/AUR, Flatpak, Snap and Web applications.
+**bauh** (ba-oo), formerly known as **fpakman**, is a graphical interface for managing your Linux software (packages/applications). It currently supports the following formats: AppImage, Debian and Arch Linux packages (including AUR), Flatpak, Snap and Web applications.
 
 Key features
-- A management panel where you can: search, install, uninstall, upgrade, downgrade and launch you applications (and more...)
+- A management panel where you can: search, install, uninstall, upgrade, downgrade and launch your applications
 - Tray mode: it launches attached to the system tray and publishes notifications when there are software updates available
 - System backup: it integrates with [Timeshift](https://github.com/teejee2008/timeshift) to provide a simple and safe backup process before applying changes to your system
 - Custom themes: it's possible to customize the tool's style/appearance. More at [Custom themes](#custom_themes) 
@@ -17,7 +17,7 @@ Key features
 ## Index
 1. [Installation](#installation)
     - [AppImage](#inst_appimage)
-    - [Ubuntu-based distros (20.04)](#inst_ubuntu)
+    - [Ubuntu 20.04 based distros (Linux Mint, PopOS, ...)](#inst_ubuntu)
     - [Arch-based distros](#inst_arch)
 2. [Isolated installation](#inst_iso)
 3. [Desktop entry / menu shortcut](#desk_entry)
@@ -26,11 +26,13 @@ Key features
 6. [Supported types](#types)
     - [AppImage](#type_appimage)
     - [Arch packages/AUR](#type_arch)
+    - [Debian](#type_deb)
     - [Flatpak](#type_flatpak)
     - [Snap](#type_snap)
     - [Native Web applications](#type_web)
 7. [General settings](#settings)
    - [Forbidden packaging formats](#forbidden_gems)
+   - [Custom suggestions / curated software](#suggestions)
 8. [Directory structure, caching and logs](#dirs)
 9. [Custom themes](#custom_themes)
 10. [Tray icons](#tray_icons)
@@ -50,13 +52,14 @@ Key features
 
 ##### Required dependencies
 - `fuse`: the package name may vary from distribution
+- `qt5dxcb-plugin` (or equivalent): the package name may vary from distribution
 
 ##### Steps
 - Download the .AppImage file attached with the latest release from https://github.com/vinifmor/bauh/releases.
 - Run the following command through a terminal: `chmod a+x bauh-${version}-x86_64.AppImage` (replace `${version}` by the respective downloaded version)
 - Launch it: `./bauh-${version}-x86_64.AppImage`
 
-#### <a name="inst_ubuntu">Ubuntu-based distros (20.04)</a>
+#### <a name="inst_ubuntu">Ubuntu 20.04 based distros (Linux Mint, PopOS, ...)</a>
 
 ##### Required dependencies
 
@@ -66,8 +69,10 @@ Key features
 
 `sudo pip3 install bauh`
 
+
 ##### Optional dependencies (they should be installed with apt-get/apt)
 
+- `aptitude`: Debian package management
 - `timeshift`: system backup
 - `aria2`: multi-threaded downloads
 - `axel`: multi-threaded downloads alternative
@@ -201,6 +206,7 @@ bauh is officially distributed through [PyPi](https://pypi.org/project/bauh) and
     - `Install AppImage file`: allows to install an external AppImage file
     - `Upgrade file`: allows to upgrade a manually installed AppImage file
     - `Update database`: manually synchronize the AppImage database
+    - `Install bauh`: installs bauh if it is running as an AppImage
 
 - Installed applications are store at `~/.local/share/bauh/appimage/installed` (or `/usr/local/share/bauh/installed` for **root**)
 - Desktop entries (menu shortcuts) of the installed applications are stored at `~/.local/share/applications` (or `/usr/share/applications` for **root**). Name pattern: `bauh_appimage_appname.desktop`
@@ -208,7 +214,6 @@ bauh is officially distributed through [PyPi](https://pypi.org/project/bauh) and
 - Downloaded database files are stored at `~/.cache/bauh/appimage` (or `/var/cache/bauh/appimage` for **root**) as **apps.db** and **releases.db**
 - Databases are updated during the initialization process if they are considered outdated
 - The configuration file is located at `~/.config/bauh/appimage.yml` (or `/etc/bauh/appimage.yml` for **root**) and it allows the following customizations:
-- Applications with ignored updates are defined at `~/.config/bauh/appimage/updates_ignored.txt` (or `/etc/bauh/appimage/updates_ignored.txt` for **root**) 
 
 ```
 database:
@@ -216,6 +221,9 @@ database:
 suggestions:
     expiration: 24  # defines the period (in hours) in which the suggestions stored in disc will be considered up to date. Use 0 if you always want to update them. Default: 24.
 ```
+
+- Applications with ignored updates are defined at `~/.config/bauh/appimage/updates_ignored.txt` (or `/etc/bauh/appimage/updates_ignored.txt` for **root**) 
+- Cached package suggestions: `~/.cache/bauh/web/suggestions.txt` (or `/var/cache/bauh/web/suggestions.yml` for **root**)
 
 
 ##### <a name="type_arch">Arch packages/AUR<a>
@@ -281,8 +289,28 @@ suggest_unneeded_uninstall: false  # if the dependencies apparently no longer ne
 suggest_optdep_uninstall: false  # if the optional dependencies associated with uninstalled packages should be suggested for uninstallation. Only the optional dependencies that are not dependencies of other packages will be suggested. Default: false (to prevent new users from making mistakes)
 categories_exp: 24  # It defines the expiration time (in HOURS) of the packages categories mapping file stored in disc. Use 0 so that it is always updated during initialization.
 aur_rebuild_detector: true # it checks if packages built with old library versions require to be rebuilt. If a package needs to be rebuilt, it will be marked for update ('rebuild-detector' must be installed). Default: true.
+prefer_repository_provider: true  # when there is just one repository provider for a given a dependency and several from AUR, it will be automatically picked.
+suggestions_exp: 24  # it defines the period (in hours) in which the suggestions stored in disc will be considered up to date. Use 0 if you always want to update them.
 ```
+- Cached package suggestions: `~/.cache/bauh/arch/suggestions.txt` (or `/var/cache/bauh/arch/suggestions.yml` for **root**)
 
+##### <a name="type_deb">Debian packages<a>
+- Basic actions supported: **search**, **install**, **uninstall**, **upgrade**
+- Custom actions supported:
+   - **synchronize packages**: synchronize the available packages on the repository (`aptitude update`)
+   - **index applications**: maps runnable installed packages (automatically done during initialization)
+   - **software sources**: launches the application responsible for managing software sources (at the moment only `software-properties-gtk` is supported) 
+- Custom package actions supported: 
+  - **purge**: removes the packages and all related configuration files
+- Files:
+  - runnable applications index: `~/.cache/bauh/debian/apps_idx.json` (or `/var/cache/bauh/debian/apps_idx.json` for **root**)
+  - cached package suggestions: `~/.cache/bauh/debian/suggestions.txt` (or `/var/cache/bauh/debian/suggestions.txt` for **root**)
+  - configuration: `~/.config/bauh/debian.yml` or `/etc/bauh/debian.yml`
+    - `index_apps.exp`: time period (**in minutes**) in which the installed applications cache is considered up-to-date during startup (default: `1440` -> 24 hours)
+    - `sync_pkgs.time`: time period (**in minutes**) in which the packages synchronization must be done on startup (default: `1440` -> 24 hours)
+    - `suggestions.exp`: it defines the period (**in hours**) in which the suggestions stored in disc will be considered up to date. Use 0 if you always want to update them.
+    - `pkg_sources.app`: it defines the application for managing the software sources. A `null` value detects one of the supported applications automatically.
+    - `remove.purge`: if the package configurations should be removed during the uninstallation process (purge). Default: false.
 
 ##### <a name="type_flatpak">Flatpak</a>
 
@@ -291,7 +319,8 @@ aur_rebuild_detector: true # it checks if packages built with old library versio
 ```
 installation_level: null # defines a default installation level: "user" or "system". (null will display a popup asking the level)
 ```
-
+- Custom actions supported:
+  - **Full update**: it completely updates the Flatpak apps and components. Useful if you are having issues with runtime updates.
 
 #### <a name="type_snap">Snap</a>
 
@@ -361,7 +390,7 @@ environment:
 suggestions:
     cache_exp: 24  # defines the period (in HOURS) in which suggestions stored on the disk are considered up to date during the initialization process. Use 0 so that they are always updated. Default: 24.
 ```
-
+- Cached package suggestions: `~/.cache/bauh/web/suggestions.txt` (or `/var/cache/bauh/web/suggestions.yml` for **root**)
 
 #### <a name="settings">General settings</a>
 
@@ -373,6 +402,7 @@ You can change some application settings via environment variables or arguments 
 - `--reset`: it cleans all configurations and cached data stored in the HOME directory.
 - `--logs`: it enables logs (for debugging purposes).
 - `--offline`: it assumes the internet connection is off.
+- `--suggestions`: it forces loading software suggestions after the initialization process.
 
 
 ##### Configuration file (**~/.config/bauh/config.yml**)
@@ -382,6 +412,7 @@ download:
   icons: true # allows bauh to download the applications icons when they are not saved on the disk
   multithreaded: true  # allows bauh to use a multithreaded download client installed on the system to download applications source files faster
   multithreaded_client: null  # defines the multi-threaded download tool to be used. If null, the default installed tool will be used (priority: aria2 > axel). Possible tools/values: aria2, axel
+  check_ssl: true  # if the security certificate (SSL) should be checked before downloading files.
 gems: null  # defines the enabled applications types managed by bauh (a null value means "all available")
 locale: null  # defines a different translation for bauh (a null value will retrieve the system's default locale)
 store_root_password: true  # if the root password should be asked only once
@@ -389,7 +420,7 @@ memory_cache:
   data_expiration: 3600 # the interval in SECONDS that data cached in memory will live
   icon_expiration: 300  # the interval in SECONDS that icons cached in memory will live
 suggestions:
-  by_type: 10  # the maximum number of application suggestions that must be retrieved per type
+  by_type: 20  # the maximum number of application suggestions that must be retrieved per type
   enabled: true  # if suggestions must be displayed when no application is installed
 system:
   notifications: true  # if system popup should be displayed for some events. e.g: when there are updates, bauh will display a system popup
@@ -407,19 +438,20 @@ ui:
   theme: defines the path to the theme/stylesheet file with a .qss extension (e.g: /path/to/my/theme.qss). For themes provided by bauh, only a string key is needed (e.g: light). Default: light
   system_theme: merges the system's theme/stylesheet with bauh's. Default: false.
 updates:
-  check_interval: 30  # the updates checking interval in SECONDS
+  check_interval: 5  # the updates checking interval in minutes
   ask_for_reboot: true  # if a dialog asking for a system reboot should be displayed after a successful upgrade
 disk:
     trim:
         after_upgrade: false # it trims the disk after a successful packages upgrade (`fstrim -a -v`). 'true' will automatically perform the trim and 'null' will display a confirmation dialog
 backup:
     enabled: true  # generate timeshift snapshots before an action (if timeshift is installed on the system)
-    mode: 'incremental' # incremental=generates a new snapshot based on another pre-exising one. 'only_one'=deletes all pre-existing snapshots and generates a fresh one.
+    mode: 'incremental' # incremental=generates a new snapshot based on another pre-exising one. 'only_one'=deletes all pre-existing self created snapshots and generates a fresh one.
     install: null  # defines if the backup should be performed before installing a package. Allowed values: null (a dialog will be displayed asking if a snapshot should be generated), true: generates the backup without asking. false: disables the backup for this operation
     uninstall: null  # defines if the backup should be performed before uninstalling a package. Allowed values: null (a dialog will be displayed asking if a snapshot should be generated), true: generates the backup without asking. false: disables the backup for this operation
     upgrade: null  # defines if the backup should be performed before upgrading a package. Allowed values: null (a dialog will be displayed asking if a snapshot should be generated), true: generates the backup without asking. false: disables the backup for this operation
     downgrade: null  # defines if the backup should be performed before downgrading a package. Allowed values: null (a dialog will be displayed asking if a snapshot should be generated), true: generates the backup without asking. false: disables the backup for this operation
     type: rsync  # defines the Timeshift backup mode -> 'rsync' (default) or 'btrfs'
+    remove_method: self  # define which backups should be removed in the 'only_one' mode. 'self': only self generated copies. 'all': all existing backups on the disc.
 boot:
     load_apps: true  # if the installed applications or suggestions should be loaded on the management panel after the initialization process. Default: true.
 ```
@@ -433,6 +465,30 @@ arch
 appimage
 # flatpak  # 'sharps' can be used to ignore a given line (comment)
 ```
+
+##### <a name="suggestions">Custom suggestions / curated software</a>
+- The software suggestions are download from [bauh-files](https://github.com/vinifmor/bauh-files) by default
+  - [appimage](https://github.com/vinifmor/bauh-files/blob/master/appimage/suggestions.txt)
+  - [arch](https://github.com/vinifmor/bauh-files/blob/master/appimage/suggestions.txt)
+  - [debian](https://github.com/vinifmor/bauh-files/blob/master/debian/suggestions_v1.txt)
+  - [flatpak](https://github.com/vinifmor/bauh-files/blob/master/flatpak/suggestions.txt)
+  - [snap](https://github.com/vinifmor/bauh-files/blob/master/snap/suggestions.txt)
+  - [web](https://github.com/vinifmor/bauh-files/blob/master/web/env/v2/suggestions.yml)
+  
+- Most of the files follow the pattern: `{priority_number}=${id or name}`
+  - Priority numbers: 0 (LOW), 1 (MEDIUM), 2 (HIGH), 3 (TOP)
+  - The priority number is used to sort the retrieved suggestions
+
+- If Linux distributions want to provide their custom suggestions files:
+  - Create the file `/etc/bauh/suggestions.conf`
+  - The content is basically a mapping for each gem to a url or local file (absolute path).
+    - Example:
+    ```
+       arch=https://mydomain.com/arch/suggestions.txt  # remote file
+       appimage=/etc/bauh/appimage/suggestions.txt  # local file (absolute path)
+       # snap = my mapping  # comments with a '#' are allowed
+    ```
+  - If a given gem name is omitted, its suggestions will be downloaded from the default location.
 
 #### <a name="dirs">Directory structure, caching and logs</a>
 - `~/.config/bauh` (or `/etc/bauh` for **root**): stores configuration files
@@ -498,6 +554,7 @@ the `view` code is only attached to them (it does not know how the `gems` handle
 - Separate modules for each packaging technology
 - Memory and performance improvements
 - Improve user experience
+- The current development changes can be checked [here](https://github.com/vinifmor/bauh/blob/staging/CHANGELOG.md)
     
 #### <a name="donations">Donations</a>
 - You can support this project through [ko-fi](https://ko-fi.com/vinifmor).

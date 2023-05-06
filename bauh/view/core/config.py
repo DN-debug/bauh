@@ -3,6 +3,9 @@ from bauh.commons.config import YAMLConfigManager
 
 FILE_PATH = f'{CONFIG_DIR}/config.yml'
 
+BACKUP_DEFAULT_REMOVE_METHOD = 'self'
+BACKUP_REMOVE_METHODS = {BACKUP_DEFAULT_REMOVE_METHOD, 'all'}
+
 
 class CoreConfigManager(YAMLConfigManager):
 
@@ -18,7 +21,7 @@ class CoreConfigManager(YAMLConfigManager):
             },
             'locale': None,
             'updates': {
-                'check_interval': 30,
+                'check_interval': 5,
                 'ask_for_reboot': True
             },
             'system': {
@@ -27,7 +30,7 @@ class CoreConfigManager(YAMLConfigManager):
             },
             'suggestions': {
                 'enabled': True,
-                'by_type': 10
+                'by_type': 15
             },
             'ui': {
                 'table': {
@@ -48,7 +51,8 @@ class CoreConfigManager(YAMLConfigManager):
             'download': {
                 'multithreaded': False,
                 'multithreaded_client': None,
-                'icons': True
+                'icons': True,
+                'check_ssl': True
             },
             'store_root_password': True,
             'disk': {
@@ -63,7 +67,8 @@ class CoreConfigManager(YAMLConfigManager):
                 'downgrade': None,
                 'upgrade': None,
                 'mode': 'incremental',
-                'type': 'rsync'
+                'type': 'rsync',
+                'remove_method': 'self'
             },
             'boot': {
                 'load_apps': True

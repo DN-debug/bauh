@@ -4,6 +4,378 @@ All notable changes to this project will be documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
+## [0.10.5] 2022-12-17
+
+### Fixes
+- Arch
+  - not properly checking all provided packages by the system when checking for conflicts (upgrade requirements). it could lead to an unbootable system or package losses.
+- UI
+  - some windows not properly being centralized (regression introduced in **0.10.4**)
+  - some windows being displayed in the wrong place (regression introduced in **0.10.4**)
+
+### Improvements
+- Arch
+  - added several test cases to ensure conflicting scenarios are properly covered when checking for upgrade requirements
+- General
+  - replaced the use of Python's `LegacyVersion` for version comparison since it will be deprecated in the next Python's major release (affects **Arch**, **AppImage** and **Flatpak** gems)
+    - `python-packaging` dependency is no longer needed
+
+### Contributions
+- flake warnings refactoring ([brccabral](https://github.com/brccabral))
+
+## [0.10.4] 2022-11-05
+
+### Improvements
+- Arch
+  - replaced some system calls by Python calls
+
+### Fixes
+- AppImage
+  - some desktop entries not being displayed on the desktop environment menu (requires the AppImage to be reinstalled) [#287](https://github.com/vinifmor/bauh/issues/287)
+- Arch
+  - not detecting some package replacements when upgrading due to conflict information having logic operators (e.g: `at-spi2-core: 2.44.1 -> 2.46.0` should replace the installed `at-spi2-atk: 2.38`)
+  - not considering some conflict expressions when retrieving upgrade requirements (it could lead to a system breakage depending on the conflict)
+- Debian
+  - not properly handling packages with names ending with `:i386` [#298](https://github.com/vinifmor/bauh/issues/298)
+- Packaging
+  - AppImage: download certificate issue [#280](https://github.com/vinifmor/bauh/issues/280)
+- GUI
+    - initialization panel size not based on the current display device size
+    - management panel: 
+      - not fully maximizing
+      - not maximizing based on the current display device size (for multiple display setups)
+      - not respecting a minimal/maximum width based on the current display device size (for multiple display setup)
+      - dialogs not respecting the current display device width
+      - not readjusting size after maximizing/minimizing
+
+### Localization (i18n)
+- Italian ([@albanobattistella](https://github.com/albanobattistella), [@luca-digrazia](https://github.com/luca-digrazia))
+- Turkish ([@agahemir](https://github.com/agahemir))
+
+
+## [0.10.3] 2022-05-30
+
+### Features
+- General
+  - new parameter `--suggestions`: forces loading software suggestions after the initialization process [#260](https://github.com/vinifmor/bauh/issues/260)
+  - allowing custom suggestions / curated software to be mapped by Linux distributions (more on [README.md](https://github.com/vinifmor/bauh#suggestions)) [#260](https://github.com/vinifmor/bauh/issues/260)
+
+### Improvements
+- Arch
+  - suggestions available for repository packages (and the associated caching expiration property `suggestions_exp`. Default: 24 hours)
+  
+- General
+  - preventing command injection through the search mechanism [#266](https://github.com/vinifmor/bauh/issues/266)
+  - code refactoring
+  
+- UI
+  - manage window minimum width related to the table columns 
+  - table columns width for maximized window
+  - settings window size rules moved to stylesheet files
+  - enforcing maximum width and height for the management window based on the primary screen resolution [#261](https://github.com/vinifmor/bauh/issues/261)
+  - some columns of the management window now have their widths limit based on a percentage of the primary screen's width:
+    - name limit: 15%
+    - description limit: 18%
+    - publisher limit: 12%
+    - version: the limit for displaying both the installed and latest versions is 22% (otherwise just the latest version will be displayed)
+  - auto-resizing the management panel when filters are applied
+  
+- Settings
+  - new property to disable SSL checking when downloading files (disabled by default)
+  
+  <p align="center">
+        <img src="https://raw.githubusercontent.com/vinifmor/bauh-files/master/pictures/releases/0.10.3/check_ssl.png">
+  </p>
+  
+  - the default value for `suggestions.by_type` is now `15`.
+
+### Fixes
+- Arch
+  - conflict resolution: removing hard dependencies that would be satisfied with the inclusion of the new package [#268](https://github.com/vinifmor/bauh/issues/268)
+    - e.g: `pipewire-pulse` conflicts with `pulseaudio`. `pulseaudio-alsa` (a dependency of pulseaudio) should not be removed, since `pipewire-pulse` provides `pulseaudio` 
+  - AUR: 
+    - build: error raised when the temporary directory does not exist (when changing the CPUs governors)
+    - date parsing when checking for updates
+    - not caching the 'LastModified' field of installed AUR dependencies (could lead to wrong display updates)
+
+- Flatpak
+  - not all selected runtime partials to upgrade are actually requested to be upgraded
+
+- Web
+  - not reading from the cached suggestions file after the first request
+  - not detecting some generated apps as installed
+
+- UI
+  - double suggestions loading call when no app is returned
+
+
+## [0.10.2] 2022-04-16
+### Improvements
+- Arch
+  - install:
+    - missing dependencies dialog now displays the packages sizes and descriptions (only from repositories)
+    - optional packages installation dialog appearance (aligned with other dependencies dialogs)
+  - uninstall:
+    - displaying hard and unnecessary requirements versions and descriptions
+  - settings:
+    - displaying different tabs for general Arch configurations and AUR's
+    
+    <p align="center">
+        <img src="https://raw.githubusercontent.com/vinifmor/bauh-files/master/pictures/releases/0.10.2/arch_aur_tabs.png">
+    </p>  
+  
+- Debian
+  - install: installation/download sizes order (to follow the upgrade dialog order) 
+  - uninstall: dependencies dialog size
+  - settings: new property to enable "purge" as the default removal method
+  
+   <p align="center">
+        <img src="https://raw.githubusercontent.com/vinifmor/bauh-files/master/pictures/releases/0.10.2/debian_purge_opt.png">
+   </p>
+
+- Flatpak
+  - faster updates reading (threaded)
+
+- General
+  - code refactoring
+
+- UI
+  - update summary: 
+    - displaying a '+' for positive sizes (previously the sign was only displayed for negative numbers) [#250](https://github.com/vinifmor/bauh/issues/250)
+    - changing some words and symbols to improve readability and cohesion [#250](https://github.com/vinifmor/bauh/issues/250)
+    - displaying update sizes as localized numbers [#250](https://github.com/vinifmor/bauh/issues/250)
+  - settings: some components' width reduced
+
+- Web
+  - installation form width
+    
+  
+### Fixes
+- Arch:
+  - displaying already installed packages when suggesting optional dependencies (pacman >= 6.0)
+
+- Debian
+  - install/upgrade: hanging when packages require manual configuration
+  - info: crashing when the package size has unexpected symbols [#251](https://github.com/vinifmor/bauh/issues/251)
+  - displaying wrong symbols among numbers in install/uninstall/upgrade outputs for systems without english encoding installed
+  - removing unused packages on any type of transaction (this is the default behaviour for aptitude)
+  
+- Flatpak
+  - some updates or download sizes not being displayed when there are new required runtimes for installed Flatpaks
+  - not displaying new required runtimes as updates (requires Flatpak >= 1.12)
+  - upgrade: informing the download size as the additional installation size
+  - random index out of bounds exception when reading updates
+
+- General
+  - not properly converting bibyte (KiB, MiB, ...) and byte (kB, MB, ...) based sizes to bytes
+  - uninstall and downgrade logs are not available [#255](https://github.com/vinifmor/bauh/issues/255)
+
+- UI
+  - not displaying the right unit symbol for byte based sizes (kB, MB, TB, ...) [#250](https://github.com/vinifmor/bauh/issues/250)
+  - some components do not properly adjust the text size [#253](https://github.com/vinifmor/bauh/issues/253)
+
+
+## [0.10.1] 2022-03-31
+
+### Features
+- Flatpak
+  - new custom action "Full update": fully updates all installed Flatpak apps and components (useful if you are having issues with runtime updates)
+
+  <p align="center">
+      <img src="https://raw.githubusercontent.com/vinifmor/bauh-files/master/pictures/releases/0.10.1/flatpak_full_update.png">
+  </p>
+
+
+### Improvements
+- General
+  - code refactoring
+  - backup: 
+    - single mode: now supports two remove methods [#244](https://github.com/vinifmor/bauh/issues/244)
+      - self: it removes only self generated backups/snapshots (default)
+      - all: it removes all existing backup/snapshots on the disc
+      
+      <p align="center">
+           <img src="https://raw.githubusercontent.com/vinifmor/bauh-files/master/pictures/releases/0.10.1/bkp_remove.png">
+      </p>
+  
+- AppImage
+  - Limiting the UI components width of the file installation and upgrade windows 
+
+- Arch
+  - text length of some popups reduced
+
+- Snap
+  - allowing the actions output locale to be decided by the Snap client
+
+- UI
+  - only displaying the "Installed" filter when installed packages are available on the table
+  - settings: margin between components reduced [#241](https://github.com/vinifmor/bauh/issues/241)
+  - "close" button added to the screenshots window (some distributions hide the default "x" on the dialog frame) [#246](https://github.com/vinifmor/bauh/issues/246)
+
+### Fixes
+- Arch
+  - regression: not displaying ignored updates
+  - dependency size: display a '?' instead of '0' ('?' should only be displayed when the size is unknown)
+
+- Debian
+  - packages descriptions are not displayed on the system's default language (when available)
+
+- Flatpak:
+  - executed commands are not displayed on the system default language and encoding (requires Flatpak >= 1.12) [#242](https://github.com/vinifmor/bauh/issues/242)
+  - applications and runtimes descriptions are not displayed on the system default language (when available) [#242](https://github.com/vinifmor/bauh/issues/242)
+
+- Web
+  - using the wrong locale format for the Accept-Language header
+
+- UI:
+  - rare crash when updating table items
+  - some action errors not being displayed on the details component when they are concatenated with sudo output 
+
+## [0.10.0] 2022-03-14
+
+### Features
+- Debian
+  - allowing Debian packages to be managed
+    - required dependencies: **aptitude** 
+    - basic actions supported: **search**, **install**, **uninstall**, **upgrade**
+    - custom actions supported:
+      - **synchronize packages**: synchronize the available packages on the repository (`aptitude update`)
+      - **index applications**: maps runnable installed packages (automatically done during initialization)
+      - **software sources**: launches the application responsible for managing software sources (at the moment only `software-properties-gtk` is supported)
+    - custom package actions supported: 
+      - **purge**: removes the packages and all related configuration files
+    
+    <p align="center">
+          <img src="https://raw.githubusercontent.com/vinifmor/bauh-files/master/pictures/releases/0.10.0/deb_man.png">
+    </p>
+
+- AppImage
+  - new custom action to self install bauh if it is running as an AppImage
+  
+  <p align="center">
+          <img src="https://raw.githubusercontent.com/vinifmor/bauh-files/master/pictures/releases/0.10.0/appim_self.png">
+  </p>
+
+- Arch
+  - AUR:
+    - able to filter orphan packages by the new "orphan" category [#236](https://github.com/vinifmor/bauh/issues/236)
+    - able to filter outdated packages by the new "out of date" category [#236](https://github.com/vinifmor/bauh/issues/236)
+
+### Improvements
+- General
+  - minor memory improvements
+  - code refactoring
+  - update checking interval on tray mode is now measured **in minutes** instead of seconds (default: 5)
+
+- Arch
+  - info dialog: 
+    - displaying the "executable" field if the package is recognized as an application
+    - displaying "description" and "version" as primary fields for repository packages
+    - displaying the "out of date" field for AUR packages [#236](https://github.com/vinifmor/bauh/issues/236)
+    - displaying the "orphan" field for AUR packages [#236](https://github.com/vinifmor/bauh/issues/236)
+  - removing the "%U" parameter before launching applications to prevent error messages
+  - minor code refactoring
+
+- Flatpak
+  - cli/tray: removed some unneeded API calls when listing updates [#234](https://github.com/vinifmor/bauh/issues/234)
+
+- UI
+  - search: 
+    - sorting packages by closest match instead of considering installed first
+    - new "Installed" filter
+    <p align="center">
+          <img src="https://raw.githubusercontent.com/vinifmor/bauh-files/master/pictures/releases/0.10.0/installed_filter.png">
+    </p>
+
+  - upgrade summary dialog size
+  - displaying tips for some custom actions (on mouse hover)
+  - screenshots: displaying the current image index as a label in the button bar (e.g: 1/3)
+  - some unneeded cursor icons removed from the apps table
+  - some icons replaced
+
+- Distribution
+  - AppImage: -~9% size reduction (96.32 MB ->  88.16 MB) 
+
+### Fixes
+- General
+  - not accepting blank root passwords [#235](https://github.com/vinifmor/bauh/issues/235)
+  - human-readable sizes (packages, files, updates, ...)
+
+- AppImage
+  - info: displaying attributes related to the installation after the application has been removed (search)
+  - history: not properly sorting releases by version
+
+- Arch:
+  - AUR:
+    - info: exception when trying to retrieve the PKGBUILD of a package without a base defined
+
+- UI
+  - some package icons would not appear if there is no URL associated with them
+  - info: not displaying boolean fields
+  
+
+## [0.9.28] 2022-02-14
+
+### Fixes
+- Distribution
+  - AppImage: not able to detect updates on the **tray mode** because the `bauh-cli` call was referencing the system's Python interpreter instead of the containerized one [#230](https://github.com/vinifmor/bauh/issues/230)
+
+
+## [0.9.27] 2022-02-11
+
+### Improvements
+- Arch:
+  - preventing AUR's installed packages from not being mapped in cases the communication with the API fails
+  - code refactoring (String formatting method)
+
+- Setup
+  - able to install bauh with python/pip without enforcing requirements through the environment variable `BAUH_SETUP_NO_REQS=1`
+
+- Distribution
+    - AppImage: -~32% size reduction (141.93 MB -> 96.32 MB)
+
+
+### Fixes
+- Arch
+  - silent crash when handling and displaying transaction sub-status
+  - AUR: not detecting installed packages anymore due to recent AUR API changes
+  - installation fails when several dependent packages conflict with the installed ones
+  - removing a duplicate call to checking for AUR updates
+
+- AppImage
+  - search: displaying duplicate installed apps for some cases
+
+
+## [0.9.26] 2022-01-31
+
+### Improvements
+- Arch
+  - not rechecking sub-dependencies of an AUR dependency to be installed
+  - allowing AUR packages to be installed as dependencies of a repository package
+  - always listing repository packages as primary options when multiple providers for a given dependency are available
+  - installation: explicitly marking installed dependent packages as "dependencies" (`--asdeps`)
+  - settings:
+    - "Auto-define dependency providers" property renamed to "Auto-match dependency by name" 
+    - new property 'prefer_repository_provider': automatically picks the single package from the repositories among several external (AUR) available as the provider for a given dependency
+
+### Fixes
+- General
+  - not handling unicode decode errors when reading a subprocess output
+  
+- Arch
+  - not upgrading a package when a dependent package relies on a specific version with epoch (e.g: alsa-plugins 1:1.2.6-1 would not be upgraded to 1:1.2.6-2 because lib32-alsa-plugins relies on 1:1.2.6)
+  - not informing all the provided packages on the transaction context to the dependency sorting algorithm (could lead to a wrong installation order)
+  - not displaying all possible AUR providers for a given dependency
+  - not displaying any substatus when retrieving packages (pacman)
+
+- UI:
+  - settings panel: confirmation dialog icon when launched alone  
+
+### UI
+- new logo by [DN-debug](https://github.com/DN-debug)
+- new dark theme (**knight**) based on Kimi-dark gtk by [DN-debug](https://github.com/DN-debug)
+
+
 ## [0.9.25] 2021-12-24
 ### Improvements
 - General

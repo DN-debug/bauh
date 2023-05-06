@@ -1,4 +1,5 @@
 import faulthandler
+import locale
 import os
 import sys
 import traceback
@@ -25,6 +26,12 @@ def main(tray: bool = False):
 
     logger = logs.new_logger(__app_name__, bool(args.logs))
 
+    try:
+        locale.setlocale(locale.LC_NUMERIC, '')
+    except Exception:
+        logger.error("Could not set locale 'LC_NUMBERIC' to '' to display localized numbers")
+        traceback.print_exc()
+
     if args.offline:
         logger.warning("offline mode activated")
 
@@ -38,13 +45,16 @@ def main(tray: bool = False):
         scale_factor = float(app_config['ui']['scale_factor'])
         os.environ['QT_SCALE_FACTOR'] = str(scale_factor)
         logger.info("Scale factor set to {}".format(scale_factor))
-    except:
+    except Exception:
         traceback.print_exc()
 
     if bool(app_config['ui']['hdpi']):
         logger.info("HDPI settings activated")
         QCoreApplication.setAttribute(Qt.AA_UseHighDpiPixmaps)
         QCoreApplication.setAttribute(Qt.AA_EnableHighDpiScaling)
+
+    if bool(args.suggestions):
+        logger.info("Forcing loading software suggestions after the initialization process")
 
     if tray or bool(args.tray):
         from bauh.tray import new_tray_icon

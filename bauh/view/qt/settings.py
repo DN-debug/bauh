@@ -2,7 +2,7 @@ import gc
 from io import StringIO
 from typing import Optional
 
-from PyQt5.QtCore import QSize, Qt, QCoreApplication, QThread, pyqtSignal
+from PyQt5.QtCore import Qt, QCoreApplication, QThread, pyqtSignal
 from PyQt5.QtGui import QCursor
 from PyQt5.QtWidgets import QWidget, QVBoxLayout, QSizePolicy, QPushButton, QHBoxLayout, QApplication
 
@@ -36,7 +36,7 @@ class ReloadManagePanel(QThread):
 
 class SettingsWindow(QWidget):
 
-    def __init__(self, manager: SoftwareManager, i18n: I18n, screen_size: QSize, window: QWidget, parent: Optional[QWidget] = None):
+    def __init__(self, manager: SoftwareManager, i18n: I18n, window: QWidget, parent: Optional[QWidget] = None):
         super(SettingsWindow, self).__init__(parent=parent, flags=Qt.CustomizeWindowHint | Qt.WindowTitleHint)
         self.setWindowTitle(f"{i18n['settings'].capitalize()} ({__app_name__})")
         self.setLayout(QVBoxLayout())
@@ -45,7 +45,7 @@ class SettingsWindow(QWidget):
         self.setSizePolicy(QSizePolicy.Minimum, QSizePolicy.Preferred)
         self.window = window
 
-        self.settings_model = self.manager.get_settings(screen_size.width(), screen_size.height())
+        self.settings_model = tuple(v for v in self.manager.get_settings())[0].component
 
         self.tab_group = to_widget(self.settings_model, i18n)
         self.tab_group.setObjectName('settings')
@@ -83,6 +83,7 @@ class SettingsWindow(QWidget):
     def show(self):
         super(SettingsWindow, self).show()
         centralize(self)
+        self.setMinimumWidth(int(self.sizeHint().width()))
 
     def closeEvent(self, event):
         if self.window and self.window.settings_window == self:
@@ -110,9 +111,12 @@ class SettingsWindow(QWidget):
 
         if success:
             if not self.window:
-                dialog.show_message(title=self.i18n['success'].capitalize(),
-                                    body=self.i18n['settings.changed.success.warning'],
-                                    type_=MessageType.INFO)
+                ConfirmationDialog(title=self.i18n['success'].capitalize(),
+                                   body=f"<p>{self.i18n['settings.changed.success.warning']}</p>",
+                                   i18n=self.i18n,
+                                   confirmation_label=self.i18n['ok'],
+                                   confirmation_icon=False,
+                                   deny_button=False).ask()
                 QCoreApplication.exit()
             elif ConfirmationDialog(title=self.i18n['warning'].capitalize(),
                                     body=f"<p>{self.i18n['settings.changed.success.warning']}</p>"

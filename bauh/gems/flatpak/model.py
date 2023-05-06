@@ -1,18 +1,20 @@
-from packaging.version import Version
+from typing import Tuple
 
 from bauh.api.abstract.model import SoftwarePackage, PackageStatus
 from bauh.commons import resource
-from bauh.gems.flatpak import ROOT_DIR, VERSION_1_2, VERSION_1_5
+from bauh.gems.flatpak import ROOT_DIR, VERSION_1_2
 from bauh.view.util.translation import I18n
 
 
 class FlatpakApplication(SoftwarePackage):
 
-    def __init__(self, id: str = None, name: str = None, version: str = None, latest_version: str = None, description: str = None,
-                 branch: str = None, arch: str = None, origin: str = None, runtime: bool = False, ref: str = None, commit: str = None,
-                 installation: str = None, i18n: I18n = None, partial: bool = False, updates_ignored: bool = False):
-        super(FlatpakApplication, self).__init__(id=id, name=name, version=version,
-                                                 latest_version=latest_version, description=description)
+    def __init__(self, id: str = None, name: str = None, version: str = None, latest_version: str = None,
+                 description: str = None, branch: str = None, arch: str = None, origin: str = None,
+                 runtime: bool = False, ref: str = None, commit: str = None, installation: str = None,
+                 i18n: I18n = None, partial: bool = False, updates_ignored: bool = False, installed: bool = False,
+                 update: bool = False, update_component: bool = False):
+        super(FlatpakApplication, self).__init__(id=id, name=name, version=version, latest_version=latest_version,
+                                                 description=description, installed=installed, update=update)
         self.ref = ref
         self.branch = branch
         self.arch = arch
@@ -25,7 +27,7 @@ class FlatpakApplication(SoftwarePackage):
         self.base_id = None
         self.base_ref = None
         self.updates_ignored = updates_ignored
-        self.update_component = False  # if it is a new app/runtime that has come as an update
+        self.update_component = update_component  # if it is a new app/runtime that has come as an update
 
         if runtime:
             self.categories = ['runtime']
@@ -123,17 +125,32 @@ class FlatpakApplication(SoftwarePackage):
 
     def __eq__(self, other):
         if isinstance(other, FlatpakApplication):
-            return self.id == other.id and self.installation == other.installation and self.branch == other.branch
+            return self.id == other.id and self.installation == other.installation and self.branch == other.branch \
+                and self.runtime == other.runtime and self.partial == other.partial and \
+                self.update_component == other.update_component
+
+    def __hash__(self) -> int:
+        hash_sum = 0
+        for attr in ('id', 'installation', 'branch', 'runtime', 'partial', 'update_component'):
+            hash_sum += hash(getattr(self, attr))
+
+        return hash_sum
 
     def get_disk_icon_path(self) -> str:
         if not self.runtime:
             return super(FlatpakApplication, self).get_disk_icon_path()
 
-    def get_update_id(self, flatpak_version: Version) -> str:
+    def get_update_id(self, flatpak_version: Tuple[str, ...]) -> str:
         if flatpak_version >= VERSION_1_2:
             return f'{self.id}/{self.branch}/{self.installation}/{self.origin}'
         else:
             return f'{self.installation}/{self.ref}'
+
+    def can_be_installed(self) -> bool:
+        return not self.update_component and not self.installed
+
+    def can_be_updated(self) -> bool:
+        return self.update_component or super(FlatpakApplication, self).can_be_updated()
 
     def can_be_uninstalled(self) -> bool:
         return not self.update_component and super(FlatpakApplication, self).can_be_uninstalled()
@@ -141,3 +158,10 @@ class FlatpakApplication(SoftwarePackage):
     def update_ref(self):
         if self.id and self.arch and self.branch:
             self.ref = f'{self.id}/{self.arch}/{self.branch}'
+
+    def __repr__(self) -> str:
+        return f'Flatpak (id={self.id}, branch={self.branch}, origin={self.origin}, installation={self.installation},' \
+               f' partial={self.partial}, update_component={self.update_component})'
+
+    def __str__(self):
+        return self.__repr__()

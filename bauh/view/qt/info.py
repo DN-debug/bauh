@@ -1,4 +1,6 @@
-from PyQt5.QtCore import QSize, Qt
+from collections.abc import Iterable
+
+from PyQt5.QtCore import Qt
 from PyQt5.QtGui import QIcon, QCursor
 from PyQt5.QtWidgets import QDialog, QVBoxLayout, QGroupBox, \
     QLineEdit, QLabel, QGridLayout, QPushButton, QPlainTextEdit, QScrollArea, QFrame, QWidget, QSizePolicy, \
@@ -6,6 +8,7 @@ from PyQt5.QtWidgets import QDialog, QVBoxLayout, QGroupBox, \
 
 from bauh.api.abstract.cache import MemoryCache
 from bauh.view.qt.components import new_spacer
+from bauh.view.qt.qt_utils import get_current_screen_geometry
 from bauh.view.util.translation import I18n
 
 IGNORED_ATTRS = {'name', '__app__'}
@@ -13,10 +16,9 @@ IGNORED_ATTRS = {'name', '__app__'}
 
 class InfoDialog(QDialog):
 
-    def __init__(self, pkg_info: dict, icon_cache: MemoryCache, i18n: I18n, screen_size: QSize):
+    def __init__(self, pkg_info: dict, icon_cache: MemoryCache, i18n: I18n):
         super(InfoDialog, self).__init__()
         self.setWindowTitle(str(pkg_info['__app__']))
-        self.screen_size = screen_size
         self.i18n = i18n
         layout = QVBoxLayout()
         self.setLayout(layout)
@@ -51,10 +53,11 @@ class InfoDialog(QDialog):
         self.setWindowIcon(QIcon(pkg_info['__app__'].model.get_type_icon_path()))
 
         for idx, attr in enumerate(sorted(pkg_info.keys())):
-            if attr not in IGNORED_ATTRS and pkg_info[attr]:
+            if attr not in IGNORED_ATTRS and pkg_info[attr] is not None:
                 i18n_key = pkg_info['__app__'].model.gem_name + '.info.' + attr.lower()
+                val = pkg_info[attr]
 
-                if isinstance(pkg_info[attr], list):
+                if not isinstance(val, str) and isinstance(pkg_info[attr], Iterable):
                     val = ' '.join([str(e).strip() for e in pkg_info[attr] if e])
                     show_val = '\n'.join(['* ' + str(e).strip() for e in pkg_info[attr] if e])
                 else:
@@ -105,7 +108,9 @@ class InfoDialog(QDialog):
         lower_container.layout().addWidget(self.bt_close)
         layout.addWidget(lower_container)
         self.setMinimumWidth(int(self.gbox_info.sizeHint().width() * 1.2))
-        self.setMaximumHeight(int(screen_size.height() * 0.8))
+
+        screen_height = get_current_screen_geometry().height()
+        self.setMaximumHeight(int(screen_height * 0.8))
         self.adjustSize()
 
     def _gen_show_button(self, idx: int, val):

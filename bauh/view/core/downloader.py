@@ -8,13 +8,14 @@ from io import StringIO
 from math import floor
 from pathlib import Path
 from threading import Thread
-from typing import Iterable, List
+from typing import Iterable, List, Optional
 
 from bauh.api.abstract.download import FileDownloader
 from bauh.api.abstract.handler import ProcessWatcher
 from bauh.api.http import HttpClient
 from bauh.commons.html import bold
-from bauh.commons.system import ProcessHandler, SimpleProcess, get_human_size_str
+from bauh.commons.system import ProcessHandler, SimpleProcess
+from bauh.commons.view_utils import get_human_size_str
 from bauh.view.util.translation import I18n
 
 RE_HAS_EXTENSION = re.compile(r'.+\.\w+$')
@@ -22,13 +23,15 @@ RE_HAS_EXTENSION = re.compile(r'.+\.\w+$')
 
 class AdaptableFileDownloader(FileDownloader):
 
-    def __init__(self, logger: logging.Logger, multithread_enabled: bool, i18n: I18n, http_client: HttpClient, multithread_client: str):
+    def __init__(self, logger: logging.Logger, multithread_enabled: bool, i18n: I18n, http_client: HttpClient,
+                 multithread_client: str, check_ssl: bool):
         self.logger = logger
         self.multithread_enabled = multithread_enabled
         self.i18n = i18n
         self.http_client = http_client
         self.supported_multithread_clients = ['aria2', 'axel']
         self.multithread_client = multithread_client
+        self.check_ssl = check_ssl
 
     @staticmethod
     def is_aria2c_available() -> bool:
@@ -42,7 +45,7 @@ class AdaptableFileDownloader(FileDownloader):
     def is_wget_available() -> bool:
         return bool(shutil.which('wget'))
 
-    def _get_aria2c_process(self, url: str, output_path: str, cwd: str, root_password: str, threads: int) -> SimpleProcess:
+    def _get_aria2c_process(self, url: str, output_path: str, cwd: str, root_password: Optional[str], threads: int) -> SimpleProcess:
         cmd = ['aria2c', url,
                '--no-conf',
                '-x', '16',
@@ -71,16 +74,22 @@ class AdaptableFileDownloader(FileDownloader):
 
         return SimpleProcess(cmd=cmd, root_password=root_password, cwd=cwd)
 
-    def _get_axel_process(self, url: str, output_path: str, cwd: str, root_password: str, threads: int) -> SimpleProcess:
+    def _get_axel_process(self, url: str, output_path: str, cwd: str, root_password: Optional[str], threads: int) -> SimpleProcess:
         cmd = ['axel', url, '-n', str(threads), '-4', '-c', '-T', '5']
+
+        if not self.check_ssl:
+            cmd.append('-k')
 
         if output_path:
             cmd.append(f'--output={output_path}')
 
         return SimpleProcess(cmd=cmd, cwd=cwd, root_password=root_password)
 
-    def _get_wget_process(self, url: str, output_path: str, cwd: str, root_password: str) -> SimpleProcess:
-        cmd = ['wget', url, '-c', '--retry-connrefused', '-t', '10', '--no-config', '-nc']
+    def _get_wget_process(self, url: str, output_path: str, cwd: str, root_password: Optional[str]) -> SimpleProcess:
+        cmd = ['wget', url, '-c', '--retry-connrefused', '-t', '10', '-nc']
+
+        if not self.check_ssl:
+            cmd.append('--no-check-certificate')
 
         if output_path:
             cmd.append('-O')
@@ -88,7 +97,7 @@ class AdaptableFileDownloader(FileDownloader):
 
         return SimpleProcess(cmd=cmd, cwd=cwd, root_password=root_password)
 
-    def _rm_bad_file(self, file_name: str, output_path: str, cwd, handler: ProcessHandler, root_password: str):
+    def _rm_bad_file(self, file_name: str, output_path: str, cwd, handler: ProcessHandler, root_password: Optional[str]):
         to_delete = output_path if output_path else f'{cwd}/{file_name}'
 
         if to_delete and os.path.exists(to_delete):
@@ -105,7 +114,7 @@ class AdaptableFileDownloader(FileDownloader):
             if size:
                 base_substatus.write(f' ( {size} )')
                 watcher.change_substatus(base_substatus.getvalue())
-        except:
+        except Exception:
             pass
 
     def _get_appropriate_threads_number(self, max_threads: int, known_size: int) -> int:
@@ -121,7 +130,7 @@ class AdaptableFileDownloader(FileDownloader):
 
         return threads
 
-    def download(self, file_url: str, watcher: ProcessWatcher, output_path: str = None, cwd: str = None, root_password: str = None, substatus_prefix: str = None, display_file_size: bool = True, max_threads: int = None, known_size: int = None) -> bool:
+    def download(self, file_url: str, watcher: ProcessWatcher, output_path: str = None, cwd: str = None, root_password: Optional[str] = None, substatus_prefix: str = None, display_file_size: bool = True, max_threads: int = None, known_size: int = None) -> bool:
         self.logger.info(f'Downloading {file_url}')
         handler = ProcessHandler(watcher)
         file_name = file_url.split('/')[-1]
@@ -184,7 +193,7 @@ class AdaptableFileDownloader(FileDownloader):
                     watcher.change_substatus(msg.getvalue())
 
             success, _ = handler.handle_simple(process)
-        except:
+        except Exception:
             traceback.print_exc()
             self._rm_bad_file(file_name, output_path, final_cwd, handler, root_password)
 

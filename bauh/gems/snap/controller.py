@@ -2,25 +2,25 @@ import re
 import time
 import traceback
 from threading import Thread
-from typing import List, Set, Type, Optional, Tuple
+from typing import List, Set, Type, Optional, Tuple, Generator
 
 from bauh.api.abstract.controller import SoftwareManager, SearchResult, ApplicationContext, UpgradeRequirements, \
-    TransactionResult, SoftwareAction
+    TransactionResult, SoftwareAction, SettingsView, SettingsController
 from bauh.api.abstract.disk import DiskCacheLoader
 from bauh.api.abstract.handler import ProcessWatcher, TaskManager
 from bauh.api.abstract.model import SoftwarePackage, PackageHistory, PackageUpdate, PackageSuggestion, \
-    SuggestionPriority, CustomSoftwareAction, PackageStatus
-from bauh.api.abstract.view import SingleSelectComponent, SelectViewType, InputOption, ViewComponent, PanelComponent, \
+    SuggestionPriority, PackageStatus
+from bauh.api.abstract.view import SingleSelectComponent, SelectViewType, InputOption, PanelComponent, \
     FormComponent, TextInputComponent
 from bauh.api.exception import NoInternetException
-from bauh.commons import resource
+from bauh.commons import suggestions
 from bauh.commons.boot import CreateConfigFile
 from bauh.commons.category import CategoriesDownloader
 from bauh.commons.html import bold
-from bauh.commons.system import SystemProcess, ProcessHandler, new_root_subprocess, get_human_size_str
-from bauh.commons.view_utils import new_select
-from bauh.gems.snap import snap, URL_CATEGORIES_FILE, CATEGORIES_FILE_PATH, SUGGESTIONS_FILE, \
-    get_icon_path, snapd, ROOT_DIR
+from bauh.commons.system import SystemProcess, ProcessHandler, new_root_subprocess
+from bauh.commons.view_utils import new_select, get_human_size_str
+from bauh.gems.snap import snap, URL_CATEGORIES_FILE, CATEGORIES_FILE_PATH, \
+    get_icon_path, snapd
 from bauh.gems.snap.config import SnapConfigManager
 from bauh.gems.snap.model import SnapApplication
 from bauh.gems.snap.snapd import SnapdClient
@@ -28,7 +28,7 @@ from bauh.gems.snap.snapd import SnapdClient
 RE_AVAILABLE_CHANNELS = re.compile(re.compile(r'(\w+)\s+(snap install.+)'))
 
 
-class SnapManager(SoftwareManager):
+class SnapManager(SoftwareManager, SettingsController):
 
     def __init__(self, context: ApplicationContext):
         super(SnapManager, self).__init__(context=context)
@@ -43,21 +43,7 @@ class SnapManager(SoftwareManager):
         self.suggestions_cache = context.cache_factory.new()
         self.info_path = None
         self.configman = SnapConfigManager()
-        self.custom_actions = (
-            CustomSoftwareAction(i18n_status_key='snap.action.refresh.status',
-                                 i18n_label_key='snap.action.refresh.label',
-                                 icon_path=resource.get_path('img/refresh.svg', ROOT_DIR),
-                                 manager_method='refresh',
-                                 requires_root=True,
-                                 i18n_confirm_key='snap.action.refresh.confirm'),
-            CustomSoftwareAction(i18n_status_key='snap.action.channel.status',
-                                 i18n_label_key='snap.action.channel.label',
-                                 i18n_confirm_key='snap.action.channel.confirm',
-                                 icon_path=resource.get_path('img/refresh.svg', ROOT_DIR),
-                                 manager_method='change_channel',
-                                 requires_root=True,
-                                 requires_confirmation=False)
-        )
+        self._suggestions_url: Optional[str] = None
 
     def _fill_categories(self, app: SnapApplication):
         categories = self.categories.get(app.name.lower())
@@ -114,7 +100,7 @@ class SnapManager(SoftwareManager):
         else:
             return SearchResult([], None, 0)
 
-    def downgrade(self, pkg: SnapApplication, root_password: str, watcher: ProcessWatcher) -> bool:
+    def downgrade(self, pkg: SnapApplication, root_password: Optional[str], watcher: ProcessWatcher) -> bool:
         if not snap.is_installed():
             watcher.print("'snap' seems not to be installed")
             return False
@@ -124,10 +110,10 @@ class SnapManager(SoftwareManager):
 
         return ProcessHandler(watcher).handle_simple(snap.downgrade_and_stream(pkg.name, root_password))[0]
 
-    def upgrade(self, requirements: UpgradeRequirements, root_password: str, watcher: ProcessWatcher) -> SystemProcess:
+    def upgrade(self, requirements: UpgradeRequirements, root_password: Optional[str], watcher: ProcessWatcher) -> SystemProcess:
         raise Exception(f"'upgrade' is not supported by {SnapManager.__class__.__name__}")
 
-    def uninstall(self, pkg: SnapApplication, root_password: str, watcher: ProcessWatcher, disk_loader: DiskCacheLoader) -> TransactionResult:
+    def uninstall(self, pkg: SnapApplication, root_password: Optional[str], watcher: ProcessWatcher, disk_loader: DiskCacheLoader) -> TransactionResult:
         if snap.is_installed() and snapd.is_running():
             uninstalled = ProcessHandler(watcher).handle_simple(snap.uninstall_and_stream(pkg.name, root_password))[0]
 
@@ -176,7 +162,7 @@ class SnapManager(SoftwareManager):
     def get_history(self, pkg: SnapApplication) -> PackageHistory:
         raise Exception(f"'get_history' is not supported by {pkg.__class__.__name__}")
 
-    def install(self, pkg: SnapApplication, root_password: str, disk_loader: DiskCacheLoader, watcher: ProcessWatcher) -> TransactionResult:
+    def install(self, pkg: SnapApplication, root_password: Optional[str], disk_loader: DiskCacheLoader, watcher: ProcessWatcher) -> TransactionResult:
         # retrieving all installed so it will be possible to know the additional installed runtimes after the operation succeeds
         if not snap.is_installed():
             watcher.print("'snap' seems not to be installed")
@@ -194,7 +180,7 @@ class SnapManager(SoftwareManager):
         try:
             channel = self._request_channel_installation(pkg=pkg, snap_config=snap_config, snapd_client=client, watcher=watcher)
             pkg.channel = channel
-        except:
+        except Exception:
             watcher.print('Aborted by user')
             return TransactionResult.fail()
 
@@ -234,7 +220,7 @@ class SnapManager(SoftwareManager):
             try:
                 net_available = self.context.internet_checker.is_available()
                 current_installed = self.read_installed(disk_loader=disk_loader, internet_available=net_available).installed
-            except:
+            except Exception:
                 new_installed = [pkg]
                 traceback.print_exc()
                 current_installed = None
@@ -260,10 +246,10 @@ class SnapManager(SoftwareManager):
     def requires_root(self, action: SoftwareAction, pkg: SnapApplication) -> bool:
         return action not in (SoftwareAction.PREPARE, SoftwareAction.SEARCH)
 
-    def refresh(self, pkg: SnapApplication, root_password: str, watcher: ProcessWatcher) -> bool:
+    def refresh(self, pkg: SnapApplication, root_password: Optional[str], watcher: ProcessWatcher) -> bool:
         return ProcessHandler(watcher).handle_simple(snap.refresh_and_stream(pkg.name, root_password))[0]
 
-    def change_channel(self, pkg: SnapApplication, root_password: str, watcher: ProcessWatcher) -> bool:
+    def change_channel(self, pkg: SnapApplication, root_password: Optional[str], watcher: ProcessWatcher) -> bool:
         if not self.context.internet_checker.is_available():
             raise NoInternetException()
 
@@ -282,7 +268,7 @@ class SnapManager(SoftwareManager):
             return ProcessHandler(watcher).handle_simple(snap.refresh_and_stream(app_name=pkg.name,
                                                                                  root_password=root_password,
                                                                                  channel=channel))[0]
-        except:
+        except Exception:
             return False
 
     def _start_category_task(self, taskman: TaskManager, create_config: CreateConfigFile, downloader: CategoriesDownloader):
@@ -299,7 +285,7 @@ class SnapManager(SoftwareManager):
             taskman.update_progress('snap_cats', 100, None)
             taskman.finish_task('snap_cats')
 
-    def prepare(self, task_manager: TaskManager, root_password: str, internet_available: bool):
+    def prepare(self, task_manager: TaskManager, root_password: Optional[str], internet_available: bool):
         create_config = CreateConfigFile(taskman=task_manager, configman=self.configman, i18n=self.i18n,
                                          task_icon_path=get_icon_path(), logger=self.logger)
         create_config.start()
@@ -331,7 +317,8 @@ class SnapManager(SoftwareManager):
                 self.logger.warning(f'It seems Snap API is not available. Search output: {output}')
                 return [self.i18n['snap.notifications.api.unavailable'].format(bold('Snaps'), bold('Snap'))]
 
-    def _fill_suggestion(self, name: str, priority: SuggestionPriority, snapd_client: SnapdClient, out: List[PackageSuggestion]):
+    def _fill_suggestion(self, name: str, priority: SuggestionPriority, snapd_client: SnapdClient,
+                         out: List[PackageSuggestion]):
         res = snapd_client.find_by_name(name)
 
         if res:
@@ -367,8 +354,7 @@ class SnapManager(SoftwareManager):
                               confinement=app_json.get('confinement'),
                               app_type=app_json.get('type'),
                               app=is_application,
-                              installed_size=app_json.get('installed-size'),
-                              extra_actions=self.custom_actions)
+                              installed_size=app_json.get('installed-size'))
 
         if disk_loader and app.installed:
             disk_loader.fill(app)
@@ -378,46 +364,87 @@ class SnapManager(SoftwareManager):
         app.status = PackageStatus.READY
         return app
 
-    def list_suggestions(self, limit: int, filter_installed: bool) -> List[PackageSuggestion]:
-        res = []
+    def _read_local_suggestions_file(self) -> Optional[str]:
+        try:
+            with open(self.suggestions_url) as f:
+                suggestions_str = f.read()
 
-        if snapd.is_running():
-            self.logger.info(f'Downloading suggestions file {SUGGESTIONS_FILE}')
-            file = self.http_client.get(SUGGESTIONS_FILE)
+            return suggestions_str
+        except FileNotFoundError:
+            self.logger.error(f"Local Snap suggestions file not found: {self.suggestions_url}")
+        except OSError:
+            self.logger.error(f"Could not read local Snap suggestions file: {self.suggestions_url}")
+            traceback.print_exc()
 
-            if not file or not file.text:
-                self.logger.warning(f"No suggestion found in {SUGGESTIONS_FILE}")
-                return res
+    def _download_remote_suggestions_file(self) -> Optional[str]:
+        self.logger.info(f"Downloading the Snap suggestions from {self.suggestions_url}")
+        file = self.http_client.get(self.suggestions_url)
+
+        if file:
+            return file.text
+
+    def list_suggestions(self, limit: int, filter_installed: bool) -> Optional[List[PackageSuggestion]]:
+        if limit == 0 or not snapd.is_running():
+            return
+
+        if self.is_local_suggestions_file_mapped():
+            suggestions_str = self._read_local_suggestions_file()
+        else:
+            suggestions_str = self._download_remote_suggestions_file()
+
+        if suggestions_str is None:
+            return
+
+        if not suggestions_str:
+            self.logger.warning(f"No Snap suggestion found in {self.suggestions_url}")
+            return
+
+        ids_prios = suggestions.parse(suggestions_str, self.logger, 'Snap')
+
+        if not ids_prios:
+            self.logger.warning(f"No Snap suggestion could be parsed from {self.suggestions_url}")
+            return
+
+        suggestion_by_priority = suggestions.sort_by_priority(ids_prios)
+        snapd_client = SnapdClient(self.logger)
+
+        if filter_installed:
+            installed = {s['name'].lower() for s in snapd_client.list_all_snaps()}
+
+            if installed:
+                suggestion_by_priority = tuple(n for n in suggestion_by_priority if n not in installed)
+
+        if suggestion_by_priority and 0 < limit < len(suggestion_by_priority):
+            suggestion_by_priority = suggestion_by_priority[0:limit]
+
+        self.logger.info(f'Available Snap suggestions: {len(suggestion_by_priority)}')
+
+        if not suggestion_by_priority:
+            return
+
+        self.logger.info("Mapping Snap suggestions")
+
+        instances, threads = [], []
+
+        res, cached_count = [], 0
+        for name in suggestion_by_priority:
+            cached_sug = self.suggestions_cache.get(name)
+
+            if cached_sug:
+                res.append(cached_sug)
+                cached_count += 1
             else:
-                self.logger.info('Mapping suggestions')
+                t = Thread(target=self._fill_suggestion, args=(name, ids_prios[name], snapd_client, res))
+                t.start()
+                threads.append(t)
+                time.sleep(0.001)  # to avoid being blocked
 
-                suggestions, threads = [], []
-                snapd_client = SnapdClient(self.logger)
-                installed = {s['name'].lower() for s in snapd_client.list_all_snaps()}
+        for t in threads:
+            t.join()
 
-                for l in file.text.split('\n'):
-                    if l:
-                        if limit <= 0 or len(suggestions) < limit:
-                            sug = l.strip().split('=')
-                            name = sug[1]
+        if cached_count > 0:
+            self.logger.info(f"Returning {cached_count} cached Snap suggestions")
 
-                            if not installed or name not in installed:
-                                cached_sug = self.suggestions_cache.get(name)
-
-                                if cached_sug:
-                                    res.append(cached_sug)
-                                else:
-                                    t = Thread(target=self._fill_suggestion, args=(name, SuggestionPriority(int(sug[0])), snapd_client, res))
-                                    t.start()
-                                    threads.append(t)
-                                    time.sleep(0.001)  # to avoid being blocked
-                        else:
-                            break
-
-                for t in threads:
-                    t.join()
-
-                res.sort(key=lambda s: s.priority.value, reverse=True)
         return res
 
     def is_default_enabled(self) -> bool:
@@ -440,48 +467,48 @@ class SnapManager(SoftwareManager):
             self.logger.info(f"Running '{pkg.name}': {cmd}")
             snap.run(cmd)
 
-    def get_screenshots(self, pkg: SnapApplication) -> List[str]:
-        return pkg.screenshots if pkg.has_screenshots() else []
+    def get_screenshots(self, pkg: SnapApplication) -> Generator[str, None, None]:
+        if pkg.screenshots:
+            yield from pkg.screenshots
 
-    def get_settings(self, screen_width: int, screen_height: int) -> Optional[ViewComponent]:
+    def get_settings(self) -> Optional[Generator[SettingsView, None, None]]:
         snap_config = self.configman.get_config()
-        max_width = 200
 
         install_channel = new_select(label=self.i18n['snap.config.install_channel'],
                                      opts=[(self.i18n['yes'].capitalize(), True, None),
                                            (self.i18n['no'].capitalize(), False, None)],
                                      value=bool(snap_config['install_channel']),
                                      id_='snap_install_channel',
-                                     max_width=max_width,
                                      tip=self.i18n['snap.config.install_channel.tip'])
 
+        cat_exp_val = snap_config['categories_exp'] if isinstance(snap_config['categories_exp'], int) else ''
         categories_exp = TextInputComponent(id_='snap_cat_exp',
-                                            value=snap_config['categories_exp'] if isinstance(snap_config['categories_exp'], int) else '',
-                                            max_width=max_width,
+                                            value=cat_exp_val,
                                             only_int=True,
                                             label=self.i18n['snap.config.categories_exp'],
                                             tooltip=self.i18n['snap.config.categories_exp.tip'])
 
-        return PanelComponent([FormComponent([install_channel, categories_exp], self.i18n['installation'].capitalize())])
+        panel = PanelComponent([FormComponent([install_channel, categories_exp], self.i18n['installation'].capitalize())])
+        yield SettingsView(self, panel)
 
-    def save_settings(self, component: ViewComponent) -> Tuple[bool, Optional[List[str]]]:
-        snap_config = self.configman.get_config()
+    def save_settings(self, component: PanelComponent) -> Tuple[bool, Optional[List[str]]]:
+        config_ = self.configman.get_config()
 
-        panel = component.components[0]
-        snap_config['install_channel'] = panel.get_component('snap_install_channel').get_selected()
-        snap_config['categories_exp'] = panel.get_component('snap_cat_exp').get_int_value()
+        form = component.get_component_by_idx(0, FormComponent)
+        config_['install_channel'] = form.get_component('snap_install_channel', SingleSelectComponent).get_selected()
+        config_['categories_exp'] = form.get_component('snap_cat_exp', TextInputComponent).get_int_value()
 
         try:
-            self.configman.save_config(snap_config)
+            self.configman.save_config(config_)
             return True, None
-        except:
+        except Exception:
             return False, [traceback.format_exc()]
 
     def _request_channel_installation(self, pkg: SnapApplication, snap_config: Optional[dict], snapd_client: SnapdClient, watcher: ProcessWatcher, exclude_current: bool = False) -> Optional[str]:
         if snap_config is None or snap_config['install_channel']:
             try:
                 data = [r for r in snapd_client.find_by_name(pkg.name) if r['name'] == pkg.name]
-            except:
+            except Exception:
                 self.logger.warning(f"snapd client could not retrieve channels for '{pkg.name}'")
                 return
 
@@ -526,3 +553,21 @@ class SnapManager(SoftwareManager):
                         raise Exception('aborted')
                     else:
                         return select.get_selected()
+
+    @property
+    def suggestions_url(self) -> str:
+        if not self._suggestions_url:
+            file_url = self.context.get_suggestion_url(self.__module__)
+
+            if not file_url:
+                file_url = 'https://raw.githubusercontent.com/vinifmor/bauh-files/master/snap/suggestions.txt'
+
+            self._suggestions_url = file_url
+
+            if file_url.startswith('/'):
+                self.logger.info(f"Local Snap suggestions file mapped: {file_url}")
+
+        return self._suggestions_url
+
+    def is_local_suggestions_file_mapped(self) -> bool:
+        return self.suggestions_url.startswith('/')

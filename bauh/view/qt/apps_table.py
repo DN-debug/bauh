@@ -15,12 +15,9 @@ from bauh.api.abstract.model import PackageStatus, CustomSoftwareAction
 from bauh.commons.html import strip_html, bold
 from bauh.view.qt.components import IconButton, QCustomMenuAction, QCustomToolbar
 from bauh.view.qt.dialog import ConfirmationDialog
+from bauh.view.qt.qt_utils import get_current_screen_geometry
 from bauh.view.qt.view_model import PackageView
 from bauh.view.util.translation import I18n
-
-NAME_MAX_SIZE = 30
-DESC_MAX_SIZE = 40
-PUBLISHER_MAX_SIZE = 25
 
 
 class UpgradeToggleButton(QToolButton):
@@ -85,7 +82,7 @@ class PackagesTable(QTableWidget):
         self.horizontalHeader().setVisible(False)
         self.horizontalHeader().setSizePolicy(QSizePolicy.Minimum, QSizePolicy.Preferred)
         self.setSelectionBehavior(QTableView.SelectRows)
-        self.setHorizontalHeaderLabels(['' for _ in range(self.columnCount())])
+        self.setHorizontalHeaderLabels(('' for _ in range(self.columnCount())))
         self.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
         self.setSizePolicy(QSizePolicy.Minimum, QSizePolicy.Preferred)
         self.horizontalScrollBar().setCursor(QCursor(Qt.PointingHandCursor))
@@ -102,9 +99,9 @@ class PackagesTable(QTableWidget):
 
     def has_any_settings(self, pkg: PackageView):
         return pkg.model.has_history() or \
-               pkg.model.can_be_downgraded() or \
-               pkg.model.supports_ignored_updates() or \
-               bool(pkg.model.get_custom_actions())
+            pkg.model.can_be_downgraded() or \
+            pkg.model.supports_ignored_updates() or \
+            bool(pkg.model.get_custom_actions())
 
     def show_pkg_actions(self, pkg: PackageView):
         menu_row = QMenu()
@@ -126,11 +123,10 @@ class PackagesTable(QTableWidget):
             if pkg.model.can_be_downgraded():
 
                 def downgrade():
-                    if ConfirmationDialog(title=self.i18n['manage_window.apps_table.row.actions.downgrade'],
-                                          body=self._parag(self.i18n[
-                                                               'manage_window.apps_table.row.actions.downgrade.popup.body'].format(
-                                              self._bold(str(pkg)))),
-                                          i18n=self.i18n).ask():
+                    if ConfirmationDialog(
+                            title=self.i18n['manage_window.apps_table.row.actions.downgrade'],
+                            body=self._parag(self.i18n['manage_window.apps_table.row.actions.downgrade.popup.body'].format(self._bold(str(pkg)))),
+                            i18n=self.i18n).ask():
                         self.window.begin_downgrade(pkg)
 
                 menu_row.addAction(QCustomMenuAction(parent=menu_row,
@@ -156,8 +152,7 @@ class PackagesTable(QTableWidget):
 
         custom_actions = pkg.model.get_custom_actions()
         if custom_actions:
-            actions = [self._map_custom_action(pkg, a, menu_row) for a in custom_actions]
-            menu_row.addActions(actions)
+            menu_row.addActions((self._map_custom_action(pkg, a, menu_row) for a in custom_actions))
 
         menu_row.adjustSize()
         menu_row.popup(QCursor.pos())
@@ -176,21 +171,24 @@ class PackagesTable(QTableWidget):
                                                                       i18n=self.i18n).ask():
                 self.window.begin_execute_custom_action(pkg, action)
 
+        tip = self.i18n[action.i18n_description_key] if action.i18n_description_key else None
         return QCustomMenuAction(parent=parent,
                                  label=self.i18n[action.i18n_label_key],
                                  icon=QIcon(action.icon_path) if action.icon_path else None,
+                                 tooltip=tip,
                                  action=custom_action)
 
     def refresh(self, pkg: PackageView):
-        self._update_row(pkg, update_check_enabled=False, change_update_col=False)
+        screen_width = get_current_screen_geometry(self.parent()).width()
+        self._update_row(pkg, screen_width, update_check_enabled=False, change_update_col=False)
 
-    def update_package(self, pkg: PackageView, change_update_col: bool = False):
+    def update_package(self, pkg: PackageView, screen_width: int, change_update_col: bool = False):
         if self.download_icons and pkg.model.icon_url:
             icon_request = QNetworkRequest(QUrl(pkg.model.icon_url))
             icon_request.setAttribute(QNetworkRequest.FollowRedirectsAttribute, True)
             self.network_man.get(icon_request)
 
-        self._update_row(pkg, change_update_col=change_update_col)
+        self._update_row(pkg, screen_width, change_update_col=change_update_col)
 
     def _uninstall(self, pkg: PackageView):
         if ConfirmationDialog(title=self.i18n['manage_window.apps_table.row.actions.uninstall.popup.title'],
@@ -257,6 +255,7 @@ class PackagesTable(QTableWidget):
         self.setEnabled(True)
 
         if pkgs:
+            screen_width = get_current_screen_geometry(self.parent()).width()
             self.setColumnCount(self.COL_NUMBER if update_check_enabled else self.COL_NUMBER - 1)
             self.setRowCount(len(pkgs))
 
@@ -268,16 +267,17 @@ class PackagesTable(QTableWidget):
                     icon_request.setAttribute(QNetworkRequest.FollowRedirectsAttribute, True)
                     self.network_man.get(icon_request)
 
-                self._update_row(pkg, update_check_enabled)
+                self._update_row(pkg, screen_width, update_check_enabled)
 
             self.scrollToTop()
 
-    def _update_row(self, pkg: PackageView, update_check_enabled: bool = True, change_update_col: bool = True):
+    def _update_row(self, pkg: PackageView, screen_width: int,
+                    update_check_enabled: bool = True, change_update_col: bool = True):
         self._set_col_icon(0, pkg)
-        self._set_col_name(1, pkg)
-        self._set_col_version(2, pkg)
-        self._set_col_description(3, pkg)
-        self._set_col_publisher(4, pkg)
+        self._set_col_name(1, pkg, screen_width)
+        self._set_col_version(2, pkg, screen_width)
+        self._set_col_description(3, pkg, screen_width)
+        self._set_col_publisher(4, pkg, screen_width)
         self._set_col_type(5, pkg)
         self._set_col_installed(6, pkg)
         self._set_col_actions(7, pkg)
@@ -351,21 +351,19 @@ class PackagesTable(QTableWidget):
             self.cache_type_icon[pkg.model.get_type()] = icon_data
 
         col_type_icon = QLabel()
-        col_type_icon.setCursor(QCursor(Qt.WhatsThisCursor))
         col_type_icon.setProperty('icon', 'true')
         col_type_icon.setSizePolicy(QSizePolicy.MinimumExpanding, QSizePolicy.Preferred)
         col_type_icon.setPixmap(icon_data['px'])
         col_type_icon.setToolTip(icon_data['tip'])
         self.setCellWidget(pkg.table_index, col, col_type_icon)
 
-    def _set_col_version(self, col: int, pkg: PackageView):
+    def _set_col_version(self, col: int, pkg: PackageView, screen_width: int):
         label_version = QLabel(str(pkg.model.version if pkg.model.version else '?'))
         label_version.setObjectName('app_version')
         label_version.setAlignment(Qt.AlignCenter)
 
         item = QWidget()
         item.setProperty('container', 'true')
-        item.setCursor(QCursor(Qt.WhatsThisCursor))
         item.setLayout(QHBoxLayout())
         item.layout().addWidget(label_version)
 
@@ -383,8 +381,12 @@ class PackagesTable(QTableWidget):
             tooltip = self.i18n['version.updates_ignored']
 
         if pkg.model.installed and pkg.model.update and not pkg.model.is_update_ignored() and pkg.model.version and pkg.model.latest_version and pkg.model.version != pkg.model.latest_version:
-            tooltip = '{}. {}: {}'.format(tooltip, self.i18n['version.latest'], pkg.model.latest_version)
-            label_version.setText(label_version.text() + '  >  {}'.format(pkg.model.latest_version))
+            tooltip = f"{tooltip} ({self.i18n['version.installed']}: {pkg.model.version}  |  " \
+                      f"{self.i18n['version.latest']}: {pkg.model.latest_version})"
+            label_version.setText(f"{label_version.text()} > {pkg.model.latest_version}")
+
+            if label_version.sizeHint().width() / screen_width > 0.22:
+                label_version.setText(pkg.model.latest_version)
 
         item.setToolTip(tooltip)
         self.setCellWidget(pkg.table_index, col, item)
@@ -408,10 +410,10 @@ class PackagesTable(QTableWidget):
 
                     if icon.isNull():
                         icon = QIcon(pkg.model.get_default_icon_path())
-                    else:
+                    elif pkg.model.icon_url:
                         self.icon_cache.add_non_existing(pkg.model.icon_url, {'icon': icon, 'bytes': None})
 
-                except:
+                except Exception:
                     icon = QIcon(pkg.model.get_default_icon_path())
 
         elif not pkg.model.icon_url:
@@ -426,26 +428,25 @@ class PackagesTable(QTableWidget):
         self._update_icon(col_icon, icon)
         self.setCellWidget(pkg.table_index, col, col_icon)
 
-    def _set_col_name(self, col: int, pkg: PackageView):
+    def _set_col_name(self, col: int, pkg: PackageView, screen_width: int):
         col_name = QLabel()
         col_name.setObjectName('app_name')
         col_name.setSizePolicy(QSizePolicy.MinimumExpanding, QSizePolicy.Preferred)
-        col_name.setCursor(QCursor(Qt.WhatsThisCursor))
 
-        name = pkg.model.get_display_name()
+        name = pkg.model.get_display_name().strip()
         if name:
             col_name.setToolTip('{}: {}'.format(self.i18n['app.name'].lower(), pkg.model.get_name_tooltip()))
         else:
             name = '...'
             col_name.setToolTip(self.i18n['app.name'].lower())
 
-        if len(name) > NAME_MAX_SIZE:
-            name = name[0:NAME_MAX_SIZE - 3] + '...'
-
-        if len(name) < NAME_MAX_SIZE:
-            name = name + ' ' * (NAME_MAX_SIZE - len(name))
-
         col_name.setText(name)
+        screen_perc = col_name.sizeHint().width() / screen_width
+
+        if screen_perc > 0.15:
+            max_chars = int(len(name) * 0.15 / screen_perc) - 3
+            col_name.setText(name[0:max_chars] + '...')
+
         self.setCellWidget(pkg.table_index, col, col_name)
 
     def _update_icon(self, label: QLabel, icon: QIcon):
@@ -455,42 +456,52 @@ class PackagesTable(QTableWidget):
         sizes = icon.availableSizes()
         return sizes[-1] if sizes else self.DEFAULT_ICON_SIZE
 
-    def _set_col_description(self, col: int, pkg: PackageView):
+    def _set_col_description(self, col: int, pkg: PackageView, screen_width: int):
         item = QLabel()
         item.setObjectName('app_description')
-        item.setCursor(QCursor(Qt.WhatsThisCursor))
 
         if pkg.model.description is not None or not pkg.model.is_application() or pkg.model.status == PackageStatus.READY:
             desc = pkg.model.description.split('\n')[0] if pkg.model.description else pkg.model.description
         else:
             desc = '...'
 
-        if desc and desc != '...' and len(desc) > DESC_MAX_SIZE:
-            desc = strip_html(desc[0: DESC_MAX_SIZE - 1]) + '...'
+        if desc and desc != '...':
+            desc = strip_html(desc)
 
         item.setText(desc)
+
+        current_width_perc = item.sizeHint().width() / screen_width
+        if current_width_perc > 0.18:
+            max_width = int(len(desc) * 0.18 / current_width_perc) - 3
+            desc = desc[0:max_width] + '...'
+            item.setText(desc)
 
         if pkg.model.description:
             item.setToolTip(pkg.model.description)
 
         self.setCellWidget(pkg.table_index, col, item)
 
-    def _set_col_publisher(self, col: int, pkg: PackageView):
+    def _set_col_publisher(self, col: int, pkg: PackageView, screen_width: int):
         item = QToolBar()
 
         publisher = pkg.model.get_publisher()
         full_publisher = None
 
+        lb_name = QLabel()
+        lb_name.setObjectName('app_publisher')
+
         if publisher:
             publisher = publisher.strip()
             full_publisher = publisher
 
-            if len(publisher) > PUBLISHER_MAX_SIZE:
-                publisher = full_publisher[0: PUBLISHER_MAX_SIZE - 3] + '...'
+            if publisher:
+                lb_name.setText(publisher)
+                screen_perc = lb_name.sizeHint().width() / screen_width
 
-        lb_name = QLabel()
-        lb_name.setObjectName('app_publisher')
-        lb_name.setCursor(QCursor(Qt.WhatsThisCursor))
+                if screen_perc > 0.12:
+                    max_chars = int(len(publisher) * 0.12 / screen_perc) - 3
+                    publisher = publisher[0: max_chars] + '...'
+                    lb_name.setText(publisher)
 
         if not publisher:
             if not pkg.model.installed:
@@ -498,7 +509,7 @@ class PackagesTable(QTableWidget):
 
             publisher = self.i18n['unknown']
 
-        lb_name.setText('  {}'.format(publisher))
+        lb_name.setText(f'  {publisher}')
         item.addWidget(lb_name)
 
         if publisher and full_publisher:
@@ -573,10 +584,10 @@ class PackagesTable(QTableWidget):
         header_horizontal = self.horizontalHeader()
         for i in range(self.columnCount()):
             if maximized:
-                if i not in (4, 5, 8):
-                    header_horizontal.setSectionResizeMode(i, QHeaderView.ResizeToContents)
-                else:
+                if i in (2, 3):
                     header_horizontal.setSectionResizeMode(i, QHeaderView.Stretch)
+                else:
+                    header_horizontal.setSectionResizeMode(i, QHeaderView.ResizeToContents)
             else:
                 header_horizontal.setSectionResizeMode(i, policy)
 

@@ -1,10 +1,11 @@
 import os
+import re
 import subprocess
 import sys
 import time
 from io import StringIO
 from subprocess import PIPE
-from typing import List, Tuple, Set, Dict, Optional
+from typing import List, Tuple, Set, Dict, Optional, Iterable, Union, IO, Any
 
 # default environment variables for subprocesses.
 from bauh.api.abstract.handler import ProcessWatcher
@@ -13,7 +14,7 @@ PY_VERSION = "{}.{}".format(sys.version_info.major, sys.version_info.minor)
 GLOBAL_PY_LIBS = '/usr/lib/python{}'.format(PY_VERSION)
 
 PATH = os.getenv('PATH')
-DEFAULT_LANG = 'en'
+DEFAULT_LANG = ''
 
 GLOBAL_INTERPRETER_PATH = ':'.join(PATH.split(':')[1:])
 
@@ -22,13 +23,15 @@ if GLOBAL_PY_LIBS not in PATH:
 
 USE_GLOBAL_INTERPRETER = bool(os.getenv('VIRTUAL_ENV'))
 
-SIZE_MULTIPLIERS = ((0.001, 'Kb'), (0.000001, 'Mb'), (0.000000001, 'Gb'), (0.000000000001, 'Tb'))
+RE_SUDO_OUTPUT = re.compile(r'[sudo]\s*[\w\s]+:\s*')
 
 
-def gen_env(global_interpreter: bool, lang: str = DEFAULT_LANG, extra_paths: Optional[Set[str]] = None) -> dict:
+def gen_env(global_interpreter: bool = USE_GLOBAL_INTERPRETER, lang: Optional[str] = DEFAULT_LANG,
+            extra_paths: Optional[Set[str]] = None) -> dict:
+
     custom_env = dict(os.environ)
 
-    if lang:
+    if lang is not None:
         custom_env['LANG'] = lang
 
     if global_interpreter:  # to avoid subprocess calls to the virtualenv python interpreter instead of the global one.
@@ -64,38 +67,43 @@ class SystemProcess:
 
 class SimpleProcess:
 
-    def __init__(self, cmd: List[str], cwd: str = '.', expected_code: int = 0,
-                 global_interpreter: bool = USE_GLOBAL_INTERPRETER, lang: str = DEFAULT_LANG, root_password: str = None,
+    def __init__(self, cmd: Iterable[str], cwd: str = '.', expected_code: int = 0,
+                 global_interpreter: bool = USE_GLOBAL_INTERPRETER, lang: Optional[str] = DEFAULT_LANG, root_password: Optional[str] = None,
                  extra_paths: Set[str] = None, error_phrases: Set[str] = None, wrong_error_phrases: Set[str] = None,
                  shell: bool = False, success_phrases: Set[str] = None, extra_env: Optional[Dict[str, str]] = None,
-                 custom_user: Optional[str] = None):
+                 custom_user: Optional[str] = None, preserve_env: Optional[Set] = None):
         pwdin, final_cmd = None, []
 
         self.shell = shell
 
         if custom_user:
             final_cmd.extend(['runuser', '-u', custom_user, '--'])
-        elif root_password is not None:
+        elif isinstance(root_password, str):
             final_cmd.extend(['sudo', '-S'])
+
+            if preserve_env:
+                for var in preserve_env:
+                    final_cmd.append(f'--preserve-env={var}')
+
             pwdin = self._new(['echo', root_password], cwd, global_interpreter, lang).stdout
 
         final_cmd.extend(cmd)
 
-        self.instance = self._new(final_cmd, cwd, global_interpreter, lang, stdin=pwdin, extra_paths=extra_paths, extra_env=extra_env)
+        self.instance = self._new(final_cmd, cwd, global_interpreter, lang=lang, stdin=pwdin,
+                                  extra_paths=extra_paths, extra_env=extra_env)
         self.expected_code = expected_code
         self.error_phrases = error_phrases
         self.wrong_error_phrases = wrong_error_phrases
         self.success_phrases = success_phrases
 
-    def _new(self, cmd: List[str], cwd: str, global_interpreter: bool, lang: str, stdin = None,
+    def _new(self, cmd: List[str], cwd: str, global_interpreter: bool, lang: Optional[str], stdin = None,
              extra_paths: Set[str] = None, extra_env: Optional[Dict[str, str]] = None) -> subprocess.Popen:
 
-        env = gen_env(global_interpreter, lang, extra_paths=extra_paths)
+        env = gen_env(global_interpreter=global_interpreter, lang=lang, extra_paths=extra_paths)
 
         if extra_env:
             for var, val in extra_env.items():
-                if var not in env:
-                    env[var] = val
+                env[var] = val
 
         args = {
             "stdout": subprocess.PIPE,
@@ -119,9 +127,12 @@ class ProcessHandler:
     def __init__(self, watcher: ProcessWatcher = None):
         self.watcher = watcher
 
-    def _notify_watcher(self, msg: str):
+    def _notify_watcher(self, msg: str, as_substatus: bool = False):
         if self.watcher:
             self.watcher.print(msg)
+
+            if as_substatus:
+                self.watcher.change_substatus(msg)
 
     def handle(self, process: SystemProcess, error_output: StringIO = None, output_handler=None) -> bool:
         self._notify_watcher(' '.join(process.subproc.args) + '\n')
@@ -130,7 +141,12 @@ class ProcessHandler:
 
         if not process.skip_stdout:
             for output in process.subproc.stdout:
-                line = output.decode().strip()
+
+                try:
+                    line = output.decode().strip()
+                except UnicodeDecodeError:
+                    line = None
+
                 if line:
                     self._notify_watcher(line)
 
@@ -148,7 +164,11 @@ class ProcessHandler:
 
         for output in process.subproc.stderr:
             if output:
-                line = output.decode().strip()
+                try:
+                    line = output.decode().strip()
+                except UnicodeDecodeError:
+                    line = None
+
                 if line:
                     self._notify_watcher(line)
 
@@ -174,14 +194,21 @@ class ProcessHandler:
 
         return process.subproc.returncode is None or process.subproc.returncode == 0
 
-    def handle_simple(self, proc: SimpleProcess, output_handler=None, notify_watcher: bool = True) -> Tuple[bool, str]:
+    def handle_simple(self, proc: SimpleProcess, output_handler=None, notify_watcher: bool = True,
+                      output_as_substatus: bool = False) -> Tuple[bool, str]:
         if notify_watcher:
             self._notify_watcher((proc.instance.args if isinstance(proc.instance.args, str) else ' '.join(proc.instance.args)) + '\n')
 
         output = StringIO()
         for o in proc.instance.stdout:
             if o:
-                line = o.decode()
+                try:
+                    line = o.decode()
+                except UnicodeDecodeError:
+                    continue
+
+                if line.startswith('[sudo]'):
+                    line = RE_SUDO_OUTPUT.split(line)[1]
 
                 output.write(line)
 
@@ -192,7 +219,7 @@ class ProcessHandler:
                         output_handler(line)
 
                     if notify_watcher:
-                        self._notify_watcher(line)
+                        self._notify_watcher(line, as_substatus=output_as_substatus)
 
         proc.instance.wait()
         output.seek(0)
@@ -223,7 +250,7 @@ class ProcessHandler:
 
 def run_cmd(cmd: str, expected_code: int = 0, ignore_return_code: bool = False, print_error: bool = True,
             cwd: str = '.', global_interpreter: bool = USE_GLOBAL_INTERPRETER, extra_paths: Set[str] = None,
-            custom_user: Optional[str] = None) -> str:
+            custom_user: Optional[str] = None, lang: Optional[str] = DEFAULT_LANG) -> Optional[str]:
     """
     runs a given command and returns its default output
     :return:
@@ -231,7 +258,7 @@ def run_cmd(cmd: str, expected_code: int = 0, ignore_return_code: bool = False, 
     args = {
         "shell": True,
         "stdout": PIPE,
-        "env": gen_env(global_interpreter, extra_paths=extra_paths),
+        "env": gen_env(global_interpreter=global_interpreter, lang=lang, extra_paths=extra_paths),
         'cwd': cwd
     }
 
@@ -240,11 +267,16 @@ def run_cmd(cmd: str, expected_code: int = 0, ignore_return_code: bool = False, 
 
     final_cmd = f"runuser -u {custom_user} -- {cmd}" if custom_user else cmd
     res = subprocess.run(final_cmd, **args)
-    return res.stdout.decode() if ignore_return_code or res.returncode == expected_code else None
+
+    if ignore_return_code or res.returncode == expected_code:
+        try:
+            return res.stdout.decode()
+        except UnicodeDecodeError:
+            pass
 
 
-def new_subprocess(cmd: List[str], cwd: str = '.', shell: bool = False, stdin = None,
-                   global_interpreter: bool = USE_GLOBAL_INTERPRETER, lang: str = DEFAULT_LANG,
+def new_subprocess(cmd: Iterable[str], cwd: str = '.', shell: bool = False, stdin: Optional[Union[None, int, IO[Any]]] = None,
+                   global_interpreter: bool = USE_GLOBAL_INTERPRETER, lang: Optional[str] = DEFAULT_LANG,
                    extra_paths: Set[str] = None, custom_user: Optional[str] = None) -> subprocess.Popen:
     args = {
         "stdout": PIPE,
@@ -259,18 +291,22 @@ def new_subprocess(cmd: List[str], cwd: str = '.', shell: bool = False, stdin = 
     return subprocess.Popen(final_cmd, **args)
 
 
-def new_root_subprocess(cmd: List[str], root_password: str, cwd: str = '.',
+def new_root_subprocess(cmd: Iterable[str], root_password: Optional[str], cwd: str = '.',
                         global_interpreter: bool = USE_GLOBAL_INTERPRETER, lang: str = DEFAULT_LANG,
-                        extra_paths: Set[str] = None) -> subprocess.Popen:
-    pwdin, final_cmd = None, []
+                        extra_paths: Set[str] = None, shell: bool = False) -> subprocess.Popen:
+    pwdin, final_cmd = subprocess.DEVNULL, []
 
-    if root_password is not None:
+    if isinstance(root_password, str):
         final_cmd.extend(['sudo', '-S'])
         pwdin = new_subprocess(['echo', root_password], global_interpreter=global_interpreter, lang=lang).stdout
 
     final_cmd.extend(cmd)
 
-    return subprocess.Popen(final_cmd, stdin=pwdin, stdout=PIPE, stderr=PIPE, cwd=cwd, env=gen_env(global_interpreter, lang, extra_paths))
+    if shell:
+        final_cmd = ' '.join(final_cmd)
+
+    return subprocess.Popen(final_cmd, stdin=pwdin, stdout=PIPE, stderr=PIPE, cwd=cwd,
+                            env=gen_env(global_interpreter, lang, extra_paths), shell=shell)
 
 
 def notify_user(msg: str, app_name: str, icon_path: str):
@@ -289,24 +325,16 @@ def get_dir_size(start_path='.'):
     return total_size
 
 
-def get_human_size_str(size) -> str:
-    int_size = int(size)
-
-    if int_size == 0:
-        return '0'
-
-    for m in SIZE_MULTIPLIERS:
-        size_str = str(int_size * m[0])
-
-        if len(size_str.split('.')[0]) < 4:
-            return '{0:.2f}'.format(float(size_str)) + ' ' + m[1]
-    return str(int_size)
-
-
 def run(cmd: List[str], success_code: int = 0, custom_user: Optional[str] = None) -> Tuple[bool, str]:
     final_cmd = ['runuser', '-u', custom_user, '--', *cmd] if custom_user else cmd
     p = subprocess.run(final_cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, stdin=subprocess.DEVNULL)
-    return p.returncode == success_code, p.stdout.decode()
+
+    try:
+        output = p.stdout.decode()
+    except UnicodeDecodeError:
+        output = ''
+
+    return p.returncode == success_code, output
 
 
 def check_active_services(*names: str) -> Dict[str, bool]:
@@ -351,4 +379,12 @@ def execute(cmd: str, shell: bool = False, cwd: Optional[str] = None, output: bo
         params['env'] = custom_env
 
     p = subprocess.run(**params)
-    return p.returncode, p.stdout.decode() if p.stdout else None
+
+    output = None
+    if p.stdout:
+        try:
+            output = p.stdout.decode()
+        except UnicodeDecodeError:
+            output = None
+
+    return p.returncode, output

@@ -30,38 +30,44 @@ class SuggestionsLoader(Thread):
         self.suggestions = suggestions
         self.create_config = create_config
         self.internet_connection = internet_connection
-        self.task_name = self.i18n['web.task.suggestions']
+        self.task_name = self.i18n['task.download_suggestions']
         self.taskman.register_task(self.task_id, self.task_name, get_icon_path())
 
     def run(self):
         ti = time.time()
-        self.taskman.update_progress(self.task_id, 0, self.i18n['task.waiting_task'].format(bold(self.create_config.task_name)))
-        self.create_config.join()
-
-        self.taskman.update_progress(self.task_id, 10, None)
-
-        if not self.internet_connection:
-            self.logger.warning("No internet connection. Only cached suggestions can be loaded")
-            self.suggestions = self.manager.read_cached(check_file=True)
-        elif not self.manager.should_download(self.create_config.config):
-            self.suggestions = self.manager.read_cached(check_file=False)
+        if self.manager.is_custom_local_file_mapped():
+            self.taskman.update_progress(self.task_id, 50, None)
+            self.logger.info(f"Local Web suggestions file mapped: {self.manager.file_url}")
+            self.suggestions = self.manager.read_cached()
         else:
-            try:
-                timestamp = datetime.utcnow().timestamp()
-                self.suggestions = self.manager.download()
+            wait_msg = self.i18n['task.waiting_task'].format(bold(self.create_config.task_name))
+            self.taskman.update_progress(self.task_id, 0, wait_msg)
+            self.create_config.join()
 
-                if self.suggestions:
-                    self.taskman.update_progress(self.task_id, 50, self.i18n['web.task.suggestions.saving'])
-                    self.manager.save_to_disk(self.suggestions, timestamp)
-            except:
-                self.logger.error("Unexpected exception")
-                traceback.print_exc()
+            self.taskman.update_progress(self.task_id, 10, None)
+
+            if not self.internet_connection:
+                self.logger.warning("No internet connection. Only cached suggestions can be loaded")
+                self.suggestions = self.manager.read_cached()
+            elif not self.manager.should_download(self.create_config.config):
+                self.suggestions = self.manager.read_cached(check_file=False)
+            else:
+                try:
+                    timestamp = datetime.utcnow().timestamp()
+                    self.suggestions = self.manager.download()
+
+                    if self.suggestions:
+                        self.taskman.update_progress(self.task_id, 50, self.i18n['web.task.suggestions.saving'])
+                        self.manager.save_to_disk(self.suggestions, timestamp)
+                except Exception:
+                    self.logger.error("Unexpected exception")
+                    traceback.print_exc()
 
         if self.suggestions_callback:
             self.taskman.update_progress(self.task_id, 75, None)
             try:
                 self.suggestions_callback(self.suggestions)
-            except:
+            except Exception:
                 self.logger.error("Unexpected exception")
                 traceback.print_exc()
 
@@ -73,7 +79,8 @@ class SuggestionsLoader(Thread):
 
 class SearchIndexGenerator(Thread):
 
-    def __init__(self, taskman: TaskManager, idxman: SearchIndexManager, suggestions_loader: SuggestionsLoader, i18n: I18n, logger: logging.Logger):
+    def __init__(self, taskman: TaskManager, idxman: SearchIndexManager, suggestions_loader: SuggestionsLoader,
+                 i18n: I18n, logger: logging.Logger):
         super(SearchIndexGenerator, self).__init__(daemon=True)
         self.taskman = taskman
         self.idxman = idxman
@@ -85,8 +92,11 @@ class SearchIndexGenerator(Thread):
 
     def run(self):
         ti = time.time()
-        self.taskman.update_progress(self.task_id, 0, self.i18n['task.waiting_task'].format(bold(self.suggestions_loader.task_name)))
-        self.suggestions_loader.join()
+
+        if self.suggestions_loader.is_alive():
+            wait_msg = self.i18n['task.waiting_task'].format(bold(self.suggestions_loader.task_name))
+            self.taskman.update_progress(self.task_id, 0, wait_msg)
+            self.suggestions_loader.join()
 
         if self.suggestions_loader.suggestions:
             self.taskman.update_progress(self.task_id, 1, None)
@@ -115,7 +125,7 @@ class UpdateEnvironmentSettings(Thread):
 
     def run(self):
         self.taskman.register_task(self.task_id, self.i18n['web.task.download_settings'], get_icon_path())
-        self.taskman.update_progress(self.task_id, 1,  self.i18n['task.waiting_task'].format(bold(self.create_config.task_name)))
+        self.taskman.update_progress(self.task_id, 1, self.i18n['task.waiting_task'].format(bold(self.create_config.task_name)))
         self.create_config.join()
 
         web_config = self.create_config.config

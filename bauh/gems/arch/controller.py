@@ -8,22 +8,20 @@ import tarfile
 import time
 import traceback
 from datetime import datetime
-from math import floor
 from pathlib import Path
 from pwd import getpwnam
 from threading import Thread
 from typing import List, Set, Type, Tuple, Dict, Iterable, Optional, Collection, Generator
 
-import requests
 from dateutil.parser import parse as parse_date
 
 from bauh import __app_name__
 from bauh.api.abstract.controller import SearchResult, SoftwareManager, ApplicationContext, UpgradeRequirements, \
-    TransactionResult, SoftwareAction
+    TransactionResult, SoftwareAction, SettingsView, SettingsController
 from bauh.api.abstract.disk import DiskCacheLoader
 from bauh.api.abstract.handler import ProcessWatcher, TaskManager
-from bauh.api.abstract.model import PackageUpdate, PackageHistory, SoftwarePackage, PackageSuggestion, PackageStatus, \
-    SuggestionPriority, CustomSoftwareAction
+from bauh.api.abstract.model import PackageUpdate, PackageHistory, SoftwarePackage, PackageStatus, \
+    CustomSoftwareAction, PackageSuggestion
 from bauh.api.abstract.view import MessageType, FormComponent, InputOption, SingleSelectComponent, SelectViewType, \
     ViewComponent, PanelComponent, MultipleSelectComponent, TextInputComponent, TextInputType, \
     FileChooserComponent, TextComponent
@@ -33,15 +31,17 @@ from bauh.commons import system
 from bauh.commons.boot import CreateConfigFile
 from bauh.commons.category import CategoriesDownloader
 from bauh.commons.html import bold
+from bauh.commons.suggestions import sort_by_priority
 from bauh.commons.system import SystemProcess, ProcessHandler, new_subprocess, run_cmd, SimpleProcess
 from bauh.commons.util import datetime_as_milis
 from bauh.commons.view_utils import new_select
 from bauh.gems.arch import aur, pacman, message, confirmation, disk, git, \
-    gpg, URL_CATEGORIES_FILE, CATEGORIES_FILE_PATH, CUSTOM_MAKEPKG_FILE, SUGGESTIONS_FILE, \
+    gpg, URL_CATEGORIES_FILE, CATEGORIES_FILE_PATH, CUSTOM_MAKEPKG_FILE, \
     get_icon_path, database, mirrors, sorting, cpu_manager, UPDATES_IGNORED_FILE, \
-    ARCH_CONFIG_DIR, EDITABLE_PKGBUILDS_FILE, URL_GPG_SERVERS, rebuild_detector, makepkg, sshell
+    ARCH_CONFIG_DIR, EDITABLE_PKGBUILDS_FILE, URL_GPG_SERVERS, rebuild_detector, makepkg, sshell, get_repo_icon_path
 from bauh.gems.arch.aur import AURClient
 from bauh.gems.arch.config import get_build_dir, ArchConfigManager
+from bauh.gems.arch.confirmation import confirm_missing_deps
 from bauh.gems.arch.dependencies import DependenciesAnalyser
 from bauh.gems.arch.download import MultithreadedDownloadService, ArchDownloadException
 from bauh.gems.arch.exceptions import PackageNotFoundException, PackageInHoldException
@@ -50,6 +50,7 @@ from bauh.gems.arch.model import ArchPackage
 from bauh.gems.arch.output import TransactionStatusHandler
 from bauh.gems.arch.pacman import RE_DEP_OPERATORS
 from bauh.gems.arch.proc_util import write_as_user
+from bauh.gems.arch.suggestions import RepositorySuggestionsDownloader
 from bauh.gems.arch.updates import UpdatesSummarizer
 from bauh.gems.arch.worker import AURIndexUpdater, ArchDiskCacheUpdater, ArchCompilationOptimizer, RefreshMirrors, \
     SyncDatabases
@@ -71,7 +72,7 @@ RE_PKG_ENDS_WITH_BIN = re.compile(r'.+[\-_]bin$')
 class TransactionContext:
 
     def __init__(self, aur_supported: bool, name: str = None, base: str = None, maintainer: str = None, watcher: ProcessWatcher = None,
-                 handler: ProcessHandler = None, dependency: bool = None, skip_opt_deps: bool = False, root_password: str = None,
+                 handler: ProcessHandler = None, dependency: bool = None, skip_opt_deps: bool = False, root_password: Optional[str] = None,
                  build_dir: str = None, project_dir: str = None, change_progress: bool = False, arch_config: dict = None,
                  install_files: Set[str] = None, repository: str = None, pkg: ArchPackage = None,
                  remote_repo_map: Dict[str, str] = None, provided_map: Dict[str, Set[str]] = None,
@@ -116,7 +117,7 @@ class TransactionContext:
         self.update_aur_index = update_aur_index
 
     @classmethod
-    def gen_context_from(cls, pkg: ArchPackage, arch_config: dict, root_password: str, handler: ProcessHandler, aur_supported: Optional[bool] = None) -> "TransactionContext":
+    def gen_context_from(cls, pkg: ArchPackage, arch_config: dict, root_password: Optional[str], handler: ProcessHandler, aur_supported: Optional[bool] = None) -> "TransactionContext":
         return cls(name=pkg.name, base=pkg.get_base_name(), maintainer=pkg.maintainer, repository=pkg.repository,
                    arch_config=arch_config, watcher=handler.watcher, handler=handler, skip_opt_deps=True,
                    change_progress=True, root_password=root_password, dependency=False,
@@ -194,7 +195,7 @@ class TransactionContext:
         self.previous_change_progress = self.change_progress
 
 
-class ArchManager(SoftwareManager):
+class ArchManager(SoftwareManager, SettingsController):
 
     def __init__(self, context: ApplicationContext, disk_cache_updater: Optional[ArchDiskCacheUpdater] = None):
         super(ArchManager, self).__init__(context=context)
@@ -209,15 +210,16 @@ class ArchManager(SoftwareManager):
         self.enabled = True
         self.arch_distro = context.distro == 'arch'
         self.categories = {}
-        self.deps_analyser = DependenciesAnalyser(self.aur_client, self.i18n)
+        self.deps_analyser = DependenciesAnalyser(self.aur_client, self.i18n, self.logger)
         self.http_client = context.http_client
         self._custom_actions: Optional[Dict[str, CustomSoftwareAction]] = None
         self.index_aur = None
         self.re_file_conflict = re.compile(r'[\w\d\-_.]+:')
         self.disk_cache_updater = disk_cache_updater
         self.pkgbuilder_user: Optional[str] = f'{__app_name__}-aur' if context.root_user else None
+        self._suggestions_downloader: Optional[RepositorySuggestionsDownloader] = None
 
-    def refresh_mirrors(self, root_password: str, watcher: ProcessWatcher) -> bool:
+    def refresh_mirrors(self, root_password: Optional[str], watcher: ProcessWatcher) -> bool:
         handler = ProcessHandler(watcher)
 
         if self._is_database_locked(handler, root_password):
@@ -286,7 +288,7 @@ class ArchManager(SoftwareManager):
         watcher.change_substatus(self.i18n['arch.sync_databases.substatus'])
         return self.sync_databases(root_password=root_password, watcher=watcher)
 
-    def sync_databases(self, root_password: str, watcher: ProcessWatcher) -> bool:
+    def sync_databases(self, root_password: Optional[str], watcher: ProcessWatcher) -> bool:
         handler = ProcessHandler(watcher)
 
         if self._is_database_locked(handler, root_password):
@@ -412,67 +414,72 @@ class ArchManager(SoftwareManager):
         res.update_total()
         return res
 
-    def _fill_aur_pkgs(self, aur_pkgs: dict, output: List[ArchPackage], disk_loader: DiskCacheLoader, internet_available: bool,
+    def _fill_aur_pkgs_offline(self, aur_pkgs: dict, arch_config: dict, output: List[ArchPackage], disk_loader: Optional[DiskCacheLoader]):
+        self.logger.info("Reading cached data from installed AUR packages")
+
+        editable_pkgbuilds = self._read_editable_pkgbuilds() if arch_config['edit_aur_pkgbuild'] is not False else None
+        for name, data in aur_pkgs.items():
+            pkg = ArchPackage(name=name, version=data.get('version'),
+                              latest_version=data.get('version'), description=data.get('description'),
+                              installed=True, repository='aur', i18n=self.i18n)
+
+            pkg.categories = self.categories.get(pkg.name)
+            pkg.pkgbuild_editable = pkg.name in editable_pkgbuilds if editable_pkgbuilds is not None else None
+
+            if disk_loader:
+                disk_loader.fill(pkg)
+
+            pkg.status = PackageStatus.READY
+            output.append(pkg)
+
+    def _fill_aur_pkgs(self, aur_pkgs: dict, output: List[ArchPackage], disk_loader: Optional[DiskCacheLoader], internet_available: bool,
                        arch_config: dict, rebuild_check: Optional[Thread], rebuild_ignored: Optional[Thread], rebuild_output: Optional[Dict[str, Set[str]]]):
 
-        if internet_available:
-            try:
-                pkgsinfo = self.aur_client.get_info(aur_pkgs.keys())
-            except requests.exceptions.ConnectionError:
-                self.logger.warning('Could not retrieve installed AUR packages API data. It seems the internet connection is off.')
-                self.logger.info("Reading only local AUR packages data")
-                return
+        if not internet_available:
+            self._fill_aur_pkgs_offline(aur_pkgs=aur_pkgs, arch_config=arch_config,
+                                        output=output, disk_loader=disk_loader)
+            return
 
-            if pkgsinfo:
-                editable_pkgbuilds = self._read_editable_pkgbuilds() if arch_config['edit_aur_pkgbuild'] is not False else None
+        pkgsinfo = self.aur_client.get_info(aur_pkgs.keys())
 
-                ignore_rebuild_check = None
-                if rebuild_ignored and rebuild_output is not None:
-                    rebuild_ignored.join()
-                    ignore_rebuild_check = rebuild_output['ignored']
-
-                to_rebuild = None
-                if rebuild_check and rebuild_output is not None:
-                    self.logger.info("Waiting for rebuild-detector")
-                    rebuild_check.join()
-                    to_rebuild = rebuild_output['to_rebuild']
-
-                for pkgdata in pkgsinfo:
-                    pkg = self.aur_mapper.map_api_data(pkgdata, aur_pkgs, self.categories)
-                    pkg.pkgbuild_editable = pkg.name in editable_pkgbuilds if editable_pkgbuilds is not None else None
-
-                    if pkg.installed:
-                        if disk_loader:
-                            disk_loader.fill(pkg, sync=True)
-
-                        pkg.update = self._check_aur_package_update(pkg=pkg,
-                                                                    installed_data=aur_pkgs.get(pkg.name, {}),
-                                                                    api_data=pkgdata)
-                        pkg.aur_update = pkg.update  # used in 'set_rebuild_check'
-
-                        if ignore_rebuild_check is not None:
-                            pkg.allow_rebuild = pkg.name not in ignore_rebuild_check
-
-                        if to_rebuild and not pkg.update and pkg.name in to_rebuild:
-                            pkg.require_rebuild = True
-
-                        pkg.update_state()
-
-                    pkg.status = PackageStatus.READY
-                    output.append(pkg)
-
+        if pkgsinfo is None:
+            self._fill_aur_pkgs_offline(aur_pkgs=aur_pkgs, arch_config=arch_config, output=output, disk_loader=disk_loader)
+        elif not pkgsinfo:
+            self.logger.warning("No data found for the supposed installed AUR packages returned from AUR API's info endpoint")
         else:
             editable_pkgbuilds = self._read_editable_pkgbuilds() if arch_config['edit_aur_pkgbuild'] is not False else None
-            for name, data in aur_pkgs.items():
-                pkg = ArchPackage(name=name, version=data.get('version'),
-                                  latest_version=data.get('version'), description=data.get('description'),
-                                  installed=True, repository='aur', i18n=self.i18n)
 
-                pkg.categories = self.categories.get(pkg.name)
+            ignore_rebuild_check = None
+            if rebuild_ignored and rebuild_output is not None:
+                rebuild_ignored.join()
+                ignore_rebuild_check = rebuild_output['ignored']
+
+            to_rebuild = None
+            if rebuild_check and rebuild_output is not None:
+                self.logger.info("Waiting for rebuild-detector")
+                rebuild_check.join()
+                to_rebuild = rebuild_output['to_rebuild']
+
+            for pkgdata in pkgsinfo:
+                pkg = self.aur_mapper.map_api_data(pkgdata, aur_pkgs, self.categories)
                 pkg.pkgbuild_editable = pkg.name in editable_pkgbuilds if editable_pkgbuilds is not None else None
 
-                if disk_loader:
-                    disk_loader.fill(pkg)
+                if pkg.installed:
+                    if disk_loader:
+                        disk_loader.fill(pkg, sync=True)
+
+                    pkg.update = self._check_aur_package_update(pkg=pkg,
+                                                                installed_data=aur_pkgs.get(pkg.name, {}),
+                                                                api_data=pkgdata)
+                    pkg.aur_update = pkg.update  # used in 'set_rebuild_check'
+
+                    if ignore_rebuild_check is not None:
+                        pkg.allow_rebuild = pkg.name not in ignore_rebuild_check
+
+                    if to_rebuild and not pkg.update and pkg.name in to_rebuild:
+                        pkg.require_rebuild = True
+
+                    pkg.update_state()
 
                 pkg.status = PackageStatus.READY
                 output.append(pkg)
@@ -485,9 +492,9 @@ class ArchManager(SoftwareManager):
                 try:
                     pkg.install_date = datetime_as_milis(parse_date(install_date))
                 except ValueError:
-                    self.logger.error("Could not parse 'install_date' ({}) from AUR package '{}'".format(install_date, pkg.name))
+                    self.logger.error(f"Could not parse 'install_date' ({install_date}) from AUR package '{pkg.name}'")
             else:
-                self.logger.error("AUR package '{}' install_date was not retrieved".format(pkg.name))
+                self.logger.error(f"AUR package '{pkg.name}' install_date was not retrieved")
 
         return self.aur_mapper.check_update(pkg=pkg, last_modified=api_data['LastModified'])
 
@@ -579,7 +586,7 @@ class ArchManager(SoftwareManager):
             rebuild_ignored = Thread(target=self.__fill_ignored_by_rebuild_detector, args=(rebuild_output, ), daemon=True)
             rebuild_ignored.start()
 
-        installed = pacman.map_installed(names=names)
+        installed = pacman.map_packages(names=names)
 
         aur_pkgs, repo_pkgs, aur_index = None, None, None
 
@@ -626,7 +633,7 @@ class ArchManager(SoftwareManager):
                 t.join()
 
         if pkgs:
-            ignored = self._list_ignored_updates()
+            ignored = self._fill_ignored_updates(set())
 
             if ignored:
                 for p in pkgs:
@@ -667,7 +674,7 @@ class ArchManager(SoftwareManager):
                         context.project_dir = clone_dir
                         srcinfo_path = f'{clone_dir}/.SRCINFO'
 
-                        logs = git.log_shas_and_timestamps(clone_dir)
+                        logs = git.list_commits(clone_dir)
                         context.watcher.change_progress(40)
 
                         if not logs or len(logs) == 1:
@@ -793,7 +800,7 @@ class ArchManager(SoftwareManager):
 
         return self._install(context)
 
-    def downgrade(self, pkg: ArchPackage, root_password: str, watcher: ProcessWatcher) -> bool:
+    def downgrade(self, pkg: ArchPackage, root_password: Optional[str], watcher: ProcessWatcher) -> bool:
         if not self.check_action_allowed(pkg, watcher):
             return False
 
@@ -827,7 +834,7 @@ class ArchManager(SoftwareManager):
         if os.path.exists(pkg.get_disk_cache_path()):
             shutil.rmtree(pkg.get_disk_cache_path())
 
-    def _is_database_locked(self, handler: ProcessHandler, root_password: str) -> bool:
+    def _is_database_locked(self, handler: ProcessHandler, root_password: Optional[str]) -> bool:
         if os.path.exists('/var/lib/pacman/db.lck'):
             handler.watcher.print('pacman database is locked')
             msg = '<p>{}</p><p>{}</p><br/>'.format(self.i18n['arch.action.db_locked.body.l1'],
@@ -843,7 +850,7 @@ class ArchManager(SoftwareManager):
                                                      body=self.i18n['arch.action.db_locked.error'],
                                                      type_=MessageType.ERROR)
                         return True
-                except:
+                except Exception:
                     self.logger.error("An error occurred while removing the pacman database lock")
                     traceback.print_exc()
                     handler.watcher.show_message(title=self.i18n['error'].capitalize(),
@@ -924,7 +931,7 @@ class ArchManager(SoftwareManager):
 
         return related
 
-    def _upgrade_repo_pkgs(self, to_upgrade: List[str], to_remove: Optional[Set[str]], handler: ProcessHandler, root_password: str,
+    def _upgrade_repo_pkgs(self, to_upgrade: List[str], to_remove: Optional[Set[str]], handler: ProcessHandler, root_password: Optional[str],
                            multithread_download: bool, pkgs_data: Dict[str, dict], overwrite_files: bool = False,
                            status_handler: TransactionStatusHandler = None, sizes: Dict[str, int] = None, download: bool = True,
                            check_syncfirst: bool = True, skip_dependency_checks: bool = False) -> bool:
@@ -1058,14 +1065,14 @@ class ArchManager(SoftwareManager):
                 output_handler.join()
                 self.logger.error("'pacman' returned an unexpected response or error phrase after upgrading the repository packages")
                 return False
-        except:
+        except Exception:
             handler.watcher.change_substatus('')
             handler.watcher.print("An error occurred while upgrading repository packages")
             self.logger.error("An error occurred while upgrading repository packages")
             traceback.print_exc()
             return False
 
-    def _remove_transaction_packages(self, to_remove: Set[str], handler: ProcessHandler, root_password: str) -> bool:
+    def _remove_transaction_packages(self, to_remove: Set[str], handler: ProcessHandler, root_password: Optional[str]) -> bool:
         output_handler = TransactionStatusHandler(watcher=handler.watcher,
                                                   i18n=self.i18n,
                                                   names=set(),
@@ -1085,7 +1092,7 @@ class ArchManager(SoftwareManager):
                 return False
 
             return True
-        except:
+        except Exception:
             self.logger.error("An error occurred while removing packages: {}".format(', '.join(to_remove)))
             traceback.print_exc()
             output_handler.stop_working()
@@ -1097,7 +1104,7 @@ class ArchManager(SoftwareManager):
                              body=self.i18n['arch.upgrade.mthreaddownload.fail'],
                              type_=MessageType.ERROR)
 
-    def upgrade(self, requirements: UpgradeRequirements, root_password: str, watcher: ProcessWatcher) -> bool:
+    def upgrade(self, requirements: UpgradeRequirements, root_password: Optional[str], watcher: ProcessWatcher) -> bool:
         self.aur_client.clean_caches()
         watcher.change_status("{}...".format(self.i18n['manage_window.status.upgrading']))
 
@@ -1173,7 +1180,7 @@ class ArchManager(SoftwareManager):
                     else:
                         any_upgraded = True
                         watcher.print(self.i18n['arch.upgrade.success'].format('"{}"'.format(pkg.name)))
-                except:
+                except Exception:
                     if any_upgraded:
                         self._update_aur_index(watcher)
 
@@ -1189,7 +1196,10 @@ class ArchManager(SoftwareManager):
         watcher.change_substatus('')
         return True
 
-    def _uninstall_pkgs(self, pkgs: Iterable[str], root_password: str, handler: ProcessHandler, ignore_dependencies: bool = False) -> bool:
+    def _uninstall_pkgs(self, pkgs: Collection[str], root_password: Optional[str],
+                        handler: ProcessHandler, ignore_dependencies: bool = False,
+                        replacers: Optional[Set[str]] = None) -> bool:
+
         status_handler = TransactionStatusHandler(watcher=handler.watcher,
                                                   i18n=self.i18n,
                                                   names={*pkgs},
@@ -1200,6 +1210,9 @@ class ArchManager(SoftwareManager):
 
         if ignore_dependencies:
             cmd.append('-dd')
+
+        if replacers:
+            cmd.extend(f'--assume-installed={r}' for r in replacers)
 
         status_handler.start()
         all_uninstalled, _ = handler.handle_simple(SimpleProcess(cmd=cmd,
@@ -1221,53 +1234,125 @@ class ArchManager(SoftwareManager):
 
         return all_uninstalled
 
-    def _request_uninstall_confirmation(self, to_uninstall: Collection[str], required: Collection[str], watcher: ProcessWatcher) -> bool:
-        reqs = [InputOption(label=p, value=p, icon_path=get_icon_path(), read_only=True) for p in required]
-        reqs_select = MultipleSelectComponent(options=reqs, default_options=set(reqs), label="", max_per_line=1 if len(reqs) < 4 else 3)
+    def _confirm_removal(self, to_remove: Collection[str], required: Collection[str],
+                         watcher: ProcessWatcher, data: Optional[Dict[str, Dict[str, str]]] = None) -> bool:
 
-        msg = '<p>{}</p><p>{}</p>'.format(self.i18n['arch.uninstall.required_by'].format(bold(str(len(required))), ', '.join(bold(n)for n in to_uninstall)) + '.',
-                                          self.i18n['arch.uninstall.required_by.advice'] + '.')
+        required_data = data if data is not None else self._map_installed_data_for_removal(required)
+        reqs = self._map_as_input_options(required, required_data, read_only=True)
+        reqs_select = MultipleSelectComponent(options=reqs, default_options=set(reqs), label="")
+
+        main_msg = self.i18n['arch.uninstall.required_by'].format(no=bold(str(len(required))),
+                                                                  pkgs=', '.join(bold(n) for n in to_remove)) + '.'
+
+        full_msg = f"<p>{main_msg}</p><p>{self.i18n['arch.uninstall.required_by.warn'] + '.'}</p>"
 
         if not watcher.request_confirmation(title=self.i18n['warning'].capitalize(),
-                                            body=msg,
+                                            body=full_msg,
                                             components=[reqs_select],
                                             confirmation_label=self.i18n['proceed'].capitalize(),
                                             deny_label=self.i18n['cancel'].capitalize(),
+                                            min_width=600,
                                             window_cancel=False):
             watcher.print("Aborted")
             return False
 
         return True
 
-    def _request_unncessary_uninstall_confirmation(self, unnecessary: Iterable[str], watcher: ProcessWatcher) -> Optional[Set[str]]:
-        reqs = [InputOption(label=p, value=p, icon_path=get_icon_path(), read_only=False) for p in unnecessary]
-        reqs_select = MultipleSelectComponent(options=reqs, default_options=set(reqs), label="", max_per_line=3 if len(reqs) > 9 else 1)
+    def _map_as_input_options(self, names: Iterable[str], data: Optional[Dict[str, Dict[str, str]]],
+                              read_only: bool = False) -> List[InputOption]:
+        opts = []
+        for p in names:
+            pkgdata = data and data.get(p)
+            pkgver, pkgdesc, pkgrepo = None, None, None
 
-        if not watcher.request_confirmation(title=self.i18n['arch.uninstall.unnecessary.l1'].capitalize(),
-                                            body='<p>{}</p>'.format(self.i18n['arch.uninstall.unnecessary.l2'] + ':'),
+            if pkgdata:
+                pkgver, pkgdesc, pkgrepo = (pkgdata.get(k) for k in ('version', 'description', 'repository'))
+
+            opts.append(InputOption(label=f"{p}{f' ({pkgver})' if pkgver else ''}", value=p, read_only=read_only,
+                                    icon_path=get_repo_icon_path() if pkgrepo == 'repo' else get_icon_path(),
+                                    tooltip=pkgdesc))
+
+        return opts
+
+    def _confirm_unneeded_removal(self, unnecessary: Iterable[str], watcher: ProcessWatcher,
+                                  data: Optional[Dict[str, Dict[str, str]]] = None) -> Optional[Set[str]]:
+        unneeded_data = data if data is not None else self._map_installed_data_for_removal(unnecessary)
+        reqs = self._map_as_input_options(unnecessary, unneeded_data)
+        reqs_select = MultipleSelectComponent(options=reqs, default_options=set(reqs), label="")
+
+        if not watcher.request_confirmation(title=self.i18n['arch.uninstall.unnecessary.l1'],
+                                            body=f"<p>{self.i18n['arch.uninstall.unnecessary.l2'] + ':'}</p>",
                                             components=[reqs_select],
                                             deny_label=self.i18n['arch.uninstall.unnecessary.proceed'].capitalize(),
                                             confirmation_label=self.i18n['arch.uninstall.unnecessary.cancel'].capitalize(),
-                                            window_cancel=False):
+                                            window_cancel=False,
+                                            min_width=500):
             return {*reqs_select.get_selected_values()}
 
-    def _request_all_unncessary_uninstall_confirmation(self, pkgs: Collection[str], context: TransactionContext):
-        reqs = [InputOption(label=p, value=p, icon_path=get_icon_path(), read_only=True) for p in pkgs]
-        reqs_select = MultipleSelectComponent(options=reqs, default_options=set(reqs), label="", max_per_line=1)
+    def _confirm_all_unneeded_removal(self, pkgs: Collection[str], context: TransactionContext,
+                                      data: Optional[Dict[str, Dict[str, str]]] = None) -> bool:
+        unnecessary_data = data if data is not None else self._map_installed_data_for_removal(pkgs)
+        reqs = self._map_as_input_options(pkgs, unnecessary_data, read_only=True)
+        reqs_select = MultipleSelectComponent(options=reqs, default_options=set(reqs), label="")
 
         if not context.watcher.request_confirmation(title=self.i18n['confirmation'].capitalize(),
                                                     body=self.i18n['arch.uninstall.unnecessary.all'].format(bold(str(len(pkgs)))),
                                                     components=[reqs_select],
                                                     confirmation_label=self.i18n['proceed'].capitalize(),
                                                     deny_label=self.i18n['cancel'].capitalize(),
-                                                    window_cancel=False):
+                                                    window_cancel=False,
+                                                    min_width=500):
             context.watcher.print("Aborted")
             return False
 
         return True
 
-    def _uninstall(self, context: TransactionContext, names: Set[str], remove_unneeded: bool = False, disk_loader: Optional[DiskCacheLoader] = None, skip_requirements: bool = False):
+    def _fill_aur_providers(self, names: str, output: Set[str]):
+        for _, data in self.aur_client.gen_updates_data(names):
+            providers = data.get('p')
+
+            if providers:
+                output.update(providers)
+
+    def _map_actual_replacers(self, names: Set[str], context: TransactionContext) -> Optional[Set[str]]:
+        if not names:
+            return
+
+        repo_replacers, aur_replacers = set(), set()
+
+        for r in names:
+            repo = context.remote_repo_map.get(r)
+
+            if repo and repo != 'aur':
+                repo_replacers.add(r)
+            elif repo == 'aur' or (context.aur_idx and r in context.aur_idx):
+                aur_replacers.add(r)
+
+        actual_replacers = set()
+
+        thread_fill_aur = None
+        if aur_replacers:
+            thread_fill_aur = Thread(target=self._fill_aur_providers, args=(aur_replacers, actual_replacers))
+            thread_fill_aur.start()
+
+        if repo_replacers:
+            repo_replace_providers = pacman.map_provided(remote=True, pkgs=repo_replacers)
+
+            if repo_replace_providers:
+                actual_replacers.update(repo_replace_providers)
+
+        if thread_fill_aur:
+            thread_fill_aur.join()
+
+        return actual_replacers
+
+    def _uninstall(self, context: TransactionContext, names: Set[str], remove_unneeded: bool = False,
+                   disk_loader: Optional[DiskCacheLoader] = None, skip_requirements: bool = False,
+                   replacers: Optional[Set[str]] = None):
+
         self._update_progress(context, 10)
+
+        actual_replacers = self._map_actual_replacers(replacers, context) if replacers else None
 
         net_available = self.context.internet_checker.is_available() if disk_loader else True
 
@@ -1276,13 +1361,14 @@ class ArchManager(SoftwareManager):
         if not skip_requirements:
             for n in names:
                 try:
-                    pkg_reqs = pacman.list_hard_requirements(n, self.logger)
+                    pkg_reqs = pacman.list_hard_requirements(name=n, logger=self.logger, assume_installed=actual_replacers)
 
                     if pkg_reqs:
                         hard_requirements.update(pkg_reqs)
+
                 except PackageInHoldException:
-                    context.watcher.show_message(title=self.i18n['error'].capitalize(),
-                                                 body=self.i18n['arch.uninstall.error.hard_dep_in_hold'].format(bold(n)),
+                    error_msg = self.i18n['arch.uninstall.error.hard_dep_in_hold'].format(bold(n))
+                    context.watcher.show_message(title=self.i18n['error'].capitalize(), body=error_msg,
                                                  type_=MessageType.ERROR)
                     return False
 
@@ -1294,9 +1380,7 @@ class ArchManager(SoftwareManager):
         if hard_requirements:
             to_uninstall.update(hard_requirements)
 
-            if not self._request_uninstall_confirmation(to_uninstall=names,
-                                                        required=hard_requirements,
-                                                        watcher=context.watcher):
+            if not self._confirm_removal(to_remove=names, required=hard_requirements, watcher=context.watcher):
                 return False
 
         if not skip_requirements and remove_unneeded:
@@ -1312,7 +1396,7 @@ class ArchManager(SoftwareManager):
 
         self._update_progress(context, 50)
 
-        if disk_loader and to_uninstall:  # loading package instances in case the uninstall succeeds
+        if disk_loader and to_uninstall:  # loading package instances in case the removal succeeds
             instances = self.read_installed(disk_loader=disk_loader,
                                             names={n for n in to_uninstall},
                                             internet_available=net_available).installed
@@ -1322,10 +1406,15 @@ class ArchManager(SoftwareManager):
         else:
             instances = None
 
-        uninstalled = self._uninstall_pkgs(to_uninstall, context.root_password, context.handler, ignore_dependencies=skip_requirements)
+        provided_by_uninstalled = pacman.map_provided(pkgs=to_uninstall)
+
+        uninstalled = self._uninstall_pkgs(to_uninstall, context.root_password, context.handler,
+                                           ignore_dependencies=skip_requirements, replacers=actual_replacers)
 
         if uninstalled:
-            if disk_loader:  # loading package instances in case the uninstall succeeds
+            self._remove_uninstalled_from_context(provided_by_uninstalled, context)
+
+            if disk_loader:  # loading package instances in case the removal succeeds
                 if instances:
                     for p in instances:
                         context.removed[p.name] = p
@@ -1333,8 +1422,8 @@ class ArchManager(SoftwareManager):
             self._update_progress(context, 70)
 
             if unnecessary_packages:
-                unnecessary_to_uninstall = self._request_unncessary_uninstall_confirmation(unnecessary=unnecessary_packages,
-                                                                                           watcher=context.watcher)
+                unnecessary_to_uninstall = self._confirm_unneeded_removal(unnecessary=unnecessary_packages,
+                                                                          watcher=context.watcher)
 
                 if unnecessary_to_uninstall:
                     context.watcher.change_substatus(self.i18n['arch.checking_unnecessary_deps'])
@@ -1354,7 +1443,8 @@ class ArchManager(SoftwareManager):
 
                     all_unnecessary_to_uninstall = {*unnecessary_to_uninstall, *unnecessary_requirements}
 
-                    if not unnecessary_requirements or self._request_all_unncessary_uninstall_confirmation(all_unnecessary_to_uninstall, context):
+                    if not unnecessary_requirements or self._confirm_all_unneeded_removal(all_unnecessary_to_uninstall,
+                                                                                          context):
                         if disk_loader:  # loading package instances in case the uninstall succeeds
                             unnecessary_instances = self.read_installed(disk_loader=disk_loader,
                                                                         internet_available=net_available,
@@ -1362,7 +1452,8 @@ class ArchManager(SoftwareManager):
                         else:
                             unnecessary_instances = None
 
-                        unneded_uninstalled = self._uninstall_pkgs(all_unnecessary_to_uninstall, context.root_password, context.handler)
+                        unneded_uninstalled = self._uninstall_pkgs(all_unnecessary_to_uninstall, context.root_password,
+                                                                   context.handler, replacers=actual_replacers)
 
                         if unneded_uninstalled:
                             to_uninstall.update(all_unnecessary_to_uninstall)
@@ -1395,7 +1486,35 @@ class ArchManager(SoftwareManager):
         self._update_progress(context, 100)
         return uninstalled
 
-    def uninstall(self, pkg: ArchPackage, root_password: str, watcher: ProcessWatcher, disk_loader: DiskCacheLoader) -> TransactionResult:
+    def _map_installed_data_for_removal(self, names: Iterable[str]) -> Optional[Dict[str, Dict[str, str]]]:
+        data = pacman.map_packages(names)
+
+        if data:
+            remapped_data = {}
+            for key, pkgs in data.items():
+                repository = 'aur' if key == 'not_signed' else 'repo'
+                for name, data in pkgs.items():
+                    remapped_data[name] = {**data, 'repository': repository}
+
+            return remapped_data
+
+    def _remove_uninstalled_from_context(self, provided_by_uninstalled: Dict[str, Set[str]], context: TransactionContext):
+        if context.provided_map and provided_by_uninstalled:  # updating the current provided context
+            for name, provided in provided_by_uninstalled.items():
+                if name in context.provided_map:
+                    del context.provided_map[name]
+
+                if provided:
+                    for exp in provided:
+                        exp_provided = context.provided_map.get(exp)
+
+                        if exp_provided and name in exp_provided:
+                            exp_provided.remove(name)
+
+                            if not exp_provided:
+                                del context.provided_map[exp]
+
+    def uninstall(self, pkg: ArchPackage, root_password: Optional[str], watcher: ProcessWatcher, disk_loader: DiskCacheLoader) -> TransactionResult:
         self.aur_client.clean_caches()
 
         handler = ProcessHandler(watcher)
@@ -1442,6 +1561,9 @@ class ArchManager(SoftwareManager):
             if info is not None:
                 self._parse_dates_string_from_info(pkg.name, info)
 
+                info['04_orphan'] = pkg.orphan
+                info['04_out_of_date'] = pkg.out_of_date
+
                 if pkg.commit:
                     info['commit'] = pkg.commit
 
@@ -1463,6 +1585,8 @@ class ArchManager(SoftwareManager):
                 '02_name': pkg.name,
                 '03_description': pkg.description,
                 '03_version': pkg.version,
+                '04_orphan': pkg.orphan,
+                '04_out_of_date': pkg.out_of_date,
                 '04_popularity': pkg.popularity,
                 '05_votes': pkg.votes,
                 '06_package_base': pkg.package_base,
@@ -1472,7 +1596,7 @@ class ArchManager(SoftwareManager):
 
             if pkg.first_submitted:
                 info['08_first_submitted'] = self._parse_timestamp(ts=pkg.first_submitted,
-                                                                   error_msg="Could not parse AUR package '{}' 'first_submitted' field".format(pkg.name, pkg.first_submitted))
+                                                                   error_msg="Could not parse AUR package '{}' 'first_submitted' field ({})".format(pkg.name, pkg.first_submitted))
 
             if pkg.last_modified:
                 info['09_last_modified'] = self._parse_timestamp(ts=pkg.last_modified,
@@ -1533,13 +1657,25 @@ class ArchManager(SoftwareManager):
             if pkg.installed:
                 info['installed files'] = pacman.list_installed_files(pkg.name)
 
+        for attr in ('version', 'description'):
+            val = info.get(attr)
+
+            if val is not None:
+                info[f'03_{attr}'] = val
+                del info[attr]
+
         return info
 
     def get_info(self, pkg: ArchPackage) -> dict:
         if pkg.repository == 'aur':
-            return self._get_info_aur_pkg(pkg)
+            info = self._get_info_aur_pkg(pkg)
         else:
-            return self._get_info_repo_pkg(pkg)
+            info = self._get_info_repo_pkg(pkg)
+
+        if pkg.is_application():
+            info['04_exec'] = pkg.command
+
+        return info
 
     def _get_history_aur_pkg(self, pkg: ArchPackage) -> PackageHistory:
 
@@ -1563,7 +1699,7 @@ class ArchManager(SoftwareManager):
             if not os.path.exists(srcinfo_path):
                 return PackageHistory.empyt(pkg)
 
-            logs = git.log_shas_and_timestamps(clone_dir)
+            logs = git.list_commits(clone_dir)
 
             if logs:
                 srcfields = {'epoch', 'pkgver', 'pkgrel'}
@@ -1628,7 +1764,7 @@ class ArchManager(SoftwareManager):
 
         try:
             Path(extract_path).mkdir(parents=True, exist_ok=True)
-        except:
+        except Exception:
             self.logger.error("Could not create temp dir {} to extract previous versions data".format(extract_path))
             traceback.print_exc()
             return data
@@ -1678,7 +1814,7 @@ class ArchManager(SoftwareManager):
                 try:
                     self.logger.info("Removing temporary history dir {}".format(extract_path))
                     shutil.rmtree(extract_path)
-                except:
+                except Exception:
                     self.logger.error("Could not remove temp path '{}'".format(extract_path))
                     raise
 
@@ -1688,10 +1824,13 @@ class ArchManager(SoftwareManager):
         else:
             return self._get_history_repo_pkg(pkg)
 
-    def _request_conflict_resolution(self, pkg: str, conflicting_pkg: str, context: TransactionContext, skip_requirements: bool = False) -> bool:
-        conflict_msg = '{} {} {}'.format(bold(pkg), self.i18n['and'], bold(conflicting_pkg))
-        if not context.watcher.request_confirmation(title=self.i18n['arch.install.conflict.popup.title'],
-                                                    body=self.i18n['arch.install.conflict.popup.body'].format(conflict_msg)):
+    def _request_conflict_resolution(self, pkg: str, conflicting_pkg: str, context: TransactionContext,
+                                     skip_requirements: bool = False) -> bool:
+
+        conflict_msg = f"{bold(pkg)} {self.i18n['and']} {bold(conflicting_pkg)}"
+        msg_body = self.i18n['arch.install.conflict.popup.body'].format(conflict_msg)
+
+        if not context.watcher.request_confirmation(title=self.i18n['arch.install.conflict.popup.title'], body=msg_body):
             context.watcher.print(self.i18n['action.cancelled'])
             return False
         else:
@@ -1702,7 +1841,8 @@ class ArchManager(SoftwareManager):
                 context.removed = {}
 
             res = self._uninstall(context=context, names={conflicting_pkg}, disk_loader=context.disk_loader,
-                                  remove_unneeded=False, skip_requirements=skip_requirements)
+                                  remove_unneeded=False, skip_requirements=skip_requirements, replacers={pkg})
+
             context.restabilish_progress()
             return res
 
@@ -1719,7 +1859,7 @@ class ArchManager(SoftwareManager):
             if dep[1] == 'aur':
                 dep_context = context.gen_dep_context(dep[0], dep[1])
                 dep_src = self.aur_client.get_src_info(dep[0])
-                dep_context.base = dep_src['pkgbase']
+                dep_context.base = dep_src['pkgbase'] if dep_src['pkgbase'] else dep[0]
                 aur_deps_context.append(dep_context)
             else:
                 repo_deps.append(dep)
@@ -1760,7 +1900,8 @@ class ArchManager(SoftwareManager):
             status_handler.start()
             installed, _ = context.handler.handle_simple(pacman.install_as_process(pkgpaths=repo_dep_names,
                                                                                    root_password=context.root_password,
-                                                                                   file=False),
+                                                                                   file=False,
+                                                                                   as_deps=True),
                                                          output_handler=status_handler.handle)
 
             if installed:
@@ -1772,14 +1913,33 @@ class ArchManager(SoftwareManager):
             else:
                 return repo_dep_names
 
-        for aur_context in aur_deps_context:
-            installed = self._install_from_aur(aur_context)
+        if aur_deps_context:
+            aur_deps_info = self.aur_client.get_info((c.base for c in aur_deps_context))
+            aur_deps_data = None
 
-            if not installed:
-                return {aur_context.name}
-            else:
-                progress += progress_increment
-                self._update_progress(context, progress)
+            if aur_deps_info:
+                aur_deps_data = {data['Name']: data for data in aur_deps_info}
+
+            for aur_context in aur_deps_context:
+                if aur_deps_data:
+                    dep_data = aur_deps_data.get(aur_context.base)
+
+                    if dep_data:
+                        last_modified = dep_data.get('LastModified')
+
+                        if last_modified and isinstance(last_modified, int):
+                            aur_context.last_modified = last_modified
+                        else:
+                            self.logger.warning(f"No valid 'LastModified' field returned for AUR package "
+                                                f"'{context.name}': {last_modified}")
+
+                installed = self._install_from_aur(aur_context)
+
+                if not installed:
+                    return {aur_context.name}
+                else:
+                    progress += progress_increment
+                    self._update_progress(context, progress)
 
         self._update_progress(context, 100)
 
@@ -1788,9 +1948,13 @@ class ArchManager(SoftwareManager):
 
         if len(pkgnames) != len(pkg_repos):  # checking if any dep not found in the distro repos are from AUR
             norepos = {p for p in pkgnames if p not in pkg_repos}
-            for pkginfo in self.aur_client.get_info(norepos):
-                if pkginfo.get('Name') in norepos:
-                    pkg_repos[pkginfo['Name']] = 'aur'
+
+            aur_info = self.aur_client.get_info(norepos)
+
+            if aur_info:
+                for pkginfo in aur_info:
+                    if pkginfo.get('Name') in norepos:
+                        pkg_repos[pkginfo['Name']] = 'aur'
 
         return pkg_repos
 
@@ -1917,7 +2081,10 @@ class ArchManager(SoftwareManager):
         cpus_changed, cpu_prev_governors = False, None
 
         if optimize:
-            cpus_changed, cpu_prev_governors = cpu_manager.set_all_cpus_to('performance', context.root_password, self.logger)
+            cpus_changed, cpu_prev_governors = cpu_manager.set_all_cpus_to('performance', context.root_password,
+                                                                           self.logger)
+
+        pkgbuilt = False
 
         try:
             pkgbuilt, output = makepkg.build(pkgdir=context.project_dir,
@@ -1928,18 +2095,21 @@ class ArchManager(SoftwareManager):
         finally:
             if cpus_changed and cpu_prev_governors:
                 self.logger.info("Restoring CPU governors")
-                cpu_manager.set_cpus(cpu_prev_governors, context.root_password, {'performance'}, self.logger)
+                cpu_manager.set_cpus(cpu_prev_governors, context.root_password, self.logger, {'performance'})
 
         self._update_progress(context, 65)
 
         if pkgbuilt:
             self.__fill_aur_output_files(context)
 
-            self.logger.info("Reading '{}' cloned repository current commit".format(context.name))
-            context.commit = git.get_current_commit(context.project_dir)
+            self.logger.info(f"Reading '{context.name}' cloned repository current commit")
+            commits = git.list_commits(context.project_dir, limit=1)
 
-            if not context.commit:
-                self.logger.error("Could not read '{}' cloned repository current commit".format(context.name))
+            if commits:
+                context.commit = commits[0][0]
+
+            else:
+                self.logger.error(f"Could not read '{context.name}' cloned repository current commit")
 
             if self._install(context=context):
                 self._save_pkgbuild(context)
@@ -2011,7 +2181,7 @@ class ArchManager(SoftwareManager):
         if not os.path.exists(cache_path):
             try:
                 os.mkdir(cache_path)
-            except:
+            except Exception:
                 print("Could not create cache directory '{}'".format(cache_path))
                 traceback.print_exc()
                 return
@@ -2020,14 +2190,14 @@ class ArchManager(SoftwareManager):
         dest_pkgbuild = '{}/PKGBUILD'.format(cache_path)
         try:
             shutil.copy(src_pkgbuild, dest_pkgbuild)
-        except:
+        except Exception:
             context.watcher.print("Could not copy '{}' to '{}'".format(src_pkgbuild, dest_pkgbuild))
             traceback.print_exc()
 
-    def _ask_and_install_missing_deps(self, context: TransactionContext,  missing_deps: List[Tuple[str, str]]) -> bool:
+    def _ask_and_install_missing_deps(self, context: TransactionContext, missing_deps: List[Tuple[str, str]]) -> bool:
         context.watcher.change_substatus(self.i18n['arch.missing_deps_found'].format(bold(context.name)))
 
-        if not confirmation.request_install_missing_deps(context.name, missing_deps, context.watcher, self.i18n):
+        if not confirm_missing_deps(missing_deps, context.watcher, self.i18n):
             context.watcher.print(self.i18n['action.cancelled'])
             return False
 
@@ -2082,6 +2252,7 @@ class ArchManager(SoftwareManager):
                                                            remote_provided_map=context.get_remote_provided_map(),
                                                            remote_repo_map=context.get_remote_repo_map(),
                                                            automatch_providers=context.config['automatch_providers'],
+                                                           prefer_repository_provider=context.config['prefer_repository_provider'],
                                                            watcher=context.watcher)
 
         tf = time.time()
@@ -2093,7 +2264,7 @@ class ArchManager(SoftwareManager):
             missing_deps = self._list_missing_deps(context)
         except PackageNotFoundException:
             return False
-        except:
+        except Exception:
             traceback.print_exc()
             return False
 
@@ -2108,9 +2279,10 @@ class ArchManager(SoftwareManager):
             return True
 
     def _handle_aur_package_deps_and_keys(self, context: TransactionContext) -> bool:
-        handled_deps = self._handle_missing_deps(context)
-        if not handled_deps:
-            return False
+        if not context.dependency:
+            handled_deps = self._handle_missing_deps(context)
+            if not handled_deps:
+                return False
 
         check_res = makepkg.check(project_dir=context.project_dir,
                                   optimize=bool(context.config['optimize']),
@@ -2196,6 +2368,7 @@ class ArchManager(SoftwareManager):
                                                                    remote_provided_map=remote_provided_map,
                                                                    remote_repo_map=remote_repo_map,
                                                                    automatch_providers=context.config['automatch_providers'],
+                                                                   prefer_repository_provider=context.config['prefer_repository_provider'],
                                                                    sort=False)
 
                 if missing_deps is None:
@@ -2214,7 +2387,7 @@ class ArchManager(SoftwareManager):
 
                 sorted_deps = sorting.sort(to_sort, {**deps_data, **subdeps_data}, provided_map)
 
-                if display_deps_dialog and not confirmation.request_install_missing_deps(None, sorted_deps, context.watcher, self.i18n):
+                if display_deps_dialog and not confirm_missing_deps(sorted_deps, context.watcher, self.i18n):
                     context.watcher.print(self.i18n['action.cancelled'])
                     return True  # because the main package installation was successful
 
@@ -2233,10 +2406,10 @@ class ArchManager(SoftwareManager):
 
     def _multithreaded_download_enabled(self, arch_config: dict) -> bool:
         return bool(arch_config['repositories_mthread_download']) \
-               and self.context.file_downloader.is_multithreaded() \
-               and pacman.is_mirrors_available()
+            and self.context.file_downloader.is_multithreaded() \
+            and pacman.is_mirrors_available()
 
-    def _download_packages(self, pkgnames: List[str], handler: ProcessHandler, root_password: str, sizes: Dict[str, int] = None, multithreaded: bool = True) -> int:
+    def _download_packages(self, pkgnames: List[str], handler: ProcessHandler, root_password: Optional[str], sizes: Dict[str, int] = None, multithreaded: bool = True) -> int:
         if multithreaded:
             download_service = MultithreadedDownloadService(file_downloader=self.context.file_downloader,
                                                             http_client=self.http_client,
@@ -2258,7 +2431,7 @@ class ArchManager(SoftwareManager):
                     return len(pkgnames)
                 else:
                     raise ArchDownloadException()
-            except:
+            except Exception:
                 traceback.print_exc()
                 raise ArchDownloadException()
 
@@ -2298,25 +2471,12 @@ class ArchManager(SoftwareManager):
                     if context.removed is None:
                         context.removed = {}
 
-                    to_install_replacements = pacman.map_replaces(names_to_install)
-
-                    skip_requirement_checking = False
-                    if to_install_replacements:  # checking if the packages to be installed replace the installed packages
-                        all_replacements = set()
-
-                        for replacements in to_install_replacements:
-                            all_replacements.update(replacements)
-
-                        if all_replacements:
-                            for pkg in to_uninstall:
-                                if pkg not in all_replacements:
-                                    break
-
-                            skip_requirement_checking = True
-
                     context.disable_progress_if_changing()
+
                     if not self._uninstall(names=to_uninstall, context=context, remove_unneeded=False,
-                                           disk_loader=context.disk_loader, skip_requirements=skip_requirement_checking):
+                                           disk_loader=context.disk_loader,
+                                           replacers=names_to_install):
+
                         context.watcher.show_message(title=self.i18n['error'],
                                                      body=self.i18n['arch.uninstalling.conflict.fail'].format(', '.join((bold(p) for p in to_uninstall))),
                                                      type_=MessageType.ERROR)
@@ -2332,7 +2492,7 @@ class ArchManager(SoftwareManager):
         to_install = []
 
         if context.missing_deps:
-            to_install.extend((d[0] for d in context.missing_deps))
+            to_install.extend((d[0] for d in context.missing_deps if d[1] != 'aur'))
 
         to_install.extend(pkgpaths)
 
@@ -2356,7 +2516,8 @@ class ArchManager(SoftwareManager):
             status_handler = None
 
         installed_with_same_name = self.read_installed(disk_loader=context.disk_loader, internet_available=True, names=context.get_package_names()).installed
-        context.watcher.change_substatus(self.i18n['arch.installing.package'].format(bold(context.name)))
+        context.watcher.change_substatus(self.i18n['arch.installing.package'].format(bold(context.name)))  #
+
         installed = self._handle_install_call(context=context, to_install=to_install, status_handler=status_handler)
 
         if status_handler:
@@ -2379,7 +2540,7 @@ class ArchManager(SoftwareManager):
                 if context.pkg and context.pkg.maintainer:
                     pkg_maintainer = context.pkg.maintainer
                 elif context.repository == 'aur':
-                    aur_infos = self.aur_client.get_info({context.name})
+                    aur_infos = self.aur_client.get_info((context.name,))
                     pkg_maintainer = aur_infos[0].get('Maintainer') if aur_infos else None
                 else:
                     pkg_maintainer = context.repository
@@ -2423,7 +2584,8 @@ class ArchManager(SoftwareManager):
                                                                        root_password=context.root_password,
                                                                        file=context.has_install_files(),
                                                                        pkgdir=context.project_dir,
-                                                                       overwrite_conflicting_files=overwrite_files),
+                                                                       overwrite_conflicting_files=overwrite_files,
+                                                                       as_deps=context.dependency),
                                              output_handler=status_handler.handle if status_handler else None)
 
     def _handle_install_call(self, context: TransactionContext, to_install: List[str], status_handler) -> bool:
@@ -2445,7 +2607,7 @@ class ArchManager(SoftwareManager):
         if context.change_progress:
             context.watcher.change_progress(val)
 
-    def _import_pgp_keys(self, pkgname: str, root_password: str, handler: ProcessHandler):
+    def _import_pgp_keys(self, pkgname: str, root_password: Optional[str], handler: ProcessHandler):
         srcinfo = self.aur_client.get_src_info(pkgname)
 
         if srcinfo.get('validpgpkeys'):
@@ -2512,7 +2674,7 @@ class ArchManager(SoftwareManager):
 
         return False
 
-    def _sync_databases(self, arch_config: dict, aur_supported: bool, root_password: str, handler: ProcessHandler, change_substatus: bool = True):
+    def _sync_databases(self, arch_config: dict, aur_supported: bool, root_password: Optional[str], handler: ProcessHandler, change_substatus: bool = True):
         if bool(arch_config['sync_databases']) and database.should_sync(arch_config, aur_supported, handler, self.logger):
             if change_substatus:
                 handler.watcher.change_substatus(self.i18n['arch.sync_databases.substatus'])
@@ -2529,7 +2691,7 @@ class ArchManager(SoftwareManager):
             watcher.change_substatus(self.i18n['arch.makepkg.optimizing'])
             ArchCompilationOptimizer(i18n=self.i18n, logger=self.context.logger, taskman=TaskManager()).optimize()
 
-    def install(self, pkg: ArchPackage, root_password: str, disk_loader: Optional[DiskCacheLoader], watcher: ProcessWatcher, context: TransactionContext = None) -> TransactionResult:
+    def install(self, pkg: ArchPackage, root_password: Optional[str], disk_loader: Optional[DiskCacheLoader], watcher: ProcessWatcher, context: TransactionContext = None) -> TransactionResult:
         if not self.check_action_allowed(pkg, watcher):
             return TransactionResult.fail()
 
@@ -2599,28 +2761,8 @@ class ArchManager(SoftwareManager):
         return TransactionResult(success=pkg_installed, installed=installed, removed=removed)
 
     def _install_from_repository(self, context: TransactionContext) -> bool:
-        try:
-            missing_deps = self._list_missing_deps(context)
-        except PackageNotFoundException:
-            self.logger.error("Package '{}' was not found")
+        if not self._handle_missing_deps(context):
             return False
-
-        if missing_deps is None:
-            return False  # called off by the user
-
-        if missing_deps:
-            if any((dep for dep in missing_deps if dep[1] == 'aur')):
-                context.watcher.show_message(title=self.i18n['error'].capitalize(),
-                                             body=self.i18n['arch.install.repo_pkg.error.aur_deps'],
-                                             type_=MessageType.ERROR)
-                return False
-
-            context.missing_deps = missing_deps
-            context.watcher.change_substatus(self.i18n['arch.missing_deps_found'].format(bold(context.name)))
-
-            if not confirmation.request_install_missing_deps(context.name, missing_deps, context.watcher, self.i18n):
-                context.watcher.print(self.i18n['action.cancelled'])
-                return False
 
         res = self._install(context)
 
@@ -2673,7 +2815,7 @@ class ArchManager(SoftwareManager):
         taskman.update_progress('arch_aur_cats', 100, None)
         taskman.finish_task('arch_aur_cats')
 
-    def prepare(self, task_manager: TaskManager, root_password: str, internet_available: bool):
+    def prepare(self, task_manager: TaskManager, root_password: Optional[str], internet_available: bool):
         create_config = CreateConfigFile(taskman=task_manager, configman=self.configman, i18n=self.i18n,
                                          task_icon_path=get_icon_path(), logger=self.logger)
         create_config.start()
@@ -2681,6 +2823,11 @@ class ArchManager(SoftwareManager):
         if internet_available:
             self.index_aur = AURIndexUpdater(context=self.context, taskman=task_manager, create_config=create_config)  # must always execute to properly determine the installed packages (even that AUR is disabled)
             self.index_aur.start()
+
+            if not self.suggestions_downloader.is_custom_local_file_mapped():
+                self.suggestions_downloader.create_config = create_config
+                self.suggestions_downloader.register_task(task_manager)
+                self.suggestions_downloader.start()
 
             refresh_mirrors = RefreshMirrors(taskman=task_manager, i18n=self.i18n, root_password=root_password,
                                              logger=self.logger, create_config=create_config)
@@ -2724,48 +2871,19 @@ class ArchManager(SoftwareManager):
         if not git.is_installed():
             return [self.i18n['arch.warning.aur_missing_dep'].format(bold('git'))]
 
-    def list_suggestions(self, limit: int, filter_installed: bool) -> List[PackageSuggestion]:
-        self.logger.info("Downloading suggestions file {}".format(SUGGESTIONS_FILE))
-        file = self.http_client.get(SUGGESTIONS_FILE)
-
-        if not file or not file.text:
-            self.logger.warning("No suggestion could be read from {}".format(SUGGESTIONS_FILE))
-        else:
-            self.logger.info("Mapping suggestions")
-            suggestions = {}
-
-            for l in file.text.split('\n'):
-                if l:
-                    if limit <= 0 or len(suggestions) < limit:
-                        lsplit = l.split('=')
-                        name = lsplit[1].strip()
-
-                        if not filter_installed or not pacman.check_installed(name):
-                            suggestions[name] = SuggestionPriority(int(lsplit[0]))
-
-            api_res = self.aur_client.get_info(suggestions.keys())
-
-            if api_res:
-                res = []
-                for pkg in api_res:
-                    if pkg.get('Name') in suggestions:
-                        res.append(PackageSuggestion(self.aur_mapper.map_api_data(pkg, {}, self.categories), suggestions[pkg['Name']]))
-
-                self.logger.info("Mapped {} suggestions".format(len(suggestions)))
-                return res
-
     def is_default_enabled(self) -> bool:
         return True
 
     def launch(self, pkg: ArchPackage):
         if pkg.command:
-            subprocess.Popen(args=[pkg.command], shell=True, env={**os.environ})
+            final_cmd = pkg.command.replace('%U', '')
+            subprocess.Popen(final_cmd, shell=True)
 
-    def get_screenshots(self, pkg: SoftwarePackage) -> List[str]:
-        pass
+    def _gen_bool_selector(self, id_: str, label_key: str, tooltip_key: str, value: bool,
+                           max_width: Optional[int] = None, capitalize_label: bool = True,
+                           label_params: Optional[list] = None, tooltip_params: Optional[list] = None) \
+            -> SingleSelectComponent:
 
-    def _gen_bool_selector(self, id_: str, label_key: str, tooltip_key: str, value: bool, max_width: int,
-                           capitalize_label: bool = True, label_params: Optional[list] = None, tooltip_params: Optional[list] = None) -> SingleSelectComponent:
         opts = [InputOption(label=self.i18n['yes'].capitalize(), value=True),
                 InputOption(label=self.i18n['no'].capitalize(), value=False)]
 
@@ -2789,109 +2907,106 @@ class ArchManager(SoftwareManager):
                                      id_=id_,
                                      capitalize_label=capitalize_label)
 
-    def get_settings(self, screen_width: int, screen_height: int) -> Optional[ViewComponent]:
-        arch_config = self.configman.get_config()
-        max_width = floor(screen_width * 0.25)
-
+    def _get_general_settings(self, arch_config: dict) -> SettingsView:
         db_sync_start = self._gen_bool_selector(id_='sync_dbs_start',
                                                 label_key='arch.config.sync_dbs',
                                                 tooltip_key='arch.config.sync_dbs_start.tip',
-                                                value=bool(arch_config['sync_databases_startup']),
-                                                max_width=max_width)
+                                                value=bool(arch_config['sync_databases_startup']))
 
-        db_sync_start.label += ' ({})'.format(self.i18n['initialization'].capitalize())
+        db_sync_start.label += f" ({self.i18n['initialization'].capitalize()})"
 
         fields = [
             self._gen_bool_selector(id_='repos',
                                     label_key='arch.config.repos',
                                     tooltip_key='arch.config.repos.tip',
-                                    value=bool(arch_config['repositories']),
-                                    max_width=max_width),
+                                    value=bool(arch_config['repositories'])),
+            self._gen_bool_selector(id_='autoprovs',
+                                    label_key='arch.config.automatch_providers',
+                                    tooltip_key='arch.config.automatch_providers.tip',
+                                    value=bool(arch_config['automatch_providers'])),
+            self._gen_bool_selector(id_='prefer_repo_provider',
+                                    label_key='arch.config.prefer_repository_provider',
+                                    tooltip_key='arch.config.prefer_repository_provider.tip',
+                                    value=bool(arch_config['prefer_repository_provider']),
+                                    tooltip_params=['AUR']),
+            self._gen_bool_selector(id_='check_dependency_breakage',
+                                    label_key='arch.config.check_dependency_breakage',
+                                    tooltip_key='arch.config.check_dependency_breakage.tip',
+                                    value=bool(arch_config['check_dependency_breakage'])),
+            self._gen_bool_selector(id_='mthread_download',
+                                    label_key='arch.config.pacman_mthread_download',
+                                    tooltip_key='arch.config.pacman_mthread_download.tip',
+                                    value=arch_config['repositories_mthread_download'],
+                                    capitalize_label=True),
+            self._gen_bool_selector(id_='sync_dbs',
+                                    label_key='arch.config.sync_dbs',
+                                    tooltip_key='arch.config.sync_dbs.tip',
+                                    value=bool(arch_config['sync_databases'])),
+            db_sync_start,
+            self._gen_bool_selector(id_='clean_cached',
+                                    label_key='arch.config.clean_cache',
+                                    tooltip_key='arch.config.clean_cache.tip',
+                                    value=bool(arch_config['clean_cached'])),
+            self._gen_bool_selector(id_='suggest_unneeded_uninstall',
+                                    label_key='arch.config.suggest_unneeded_uninstall',
+                                    tooltip_params=['"{}"'.format(self.i18n['arch.config.suggest_optdep_uninstall'])],
+                                    tooltip_key='arch.config.suggest_unneeded_uninstall.tip',
+                                    value=bool(arch_config['suggest_unneeded_uninstall'])),
+            self._gen_bool_selector(id_='suggest_optdep_uninstall',
+                                    label_key='arch.config.suggest_optdep_uninstall',
+                                    tooltip_key='arch.config.suggest_optdep_uninstall.tip',
+                                    value=bool(arch_config['suggest_optdep_uninstall'])),
+            self._gen_bool_selector(id_='ref_mirs',
+                                    label_key='arch.config.refresh_mirrors',
+                                    tooltip_key='arch.config.refresh_mirrors.tip',
+                                    value=bool(arch_config['refresh_mirrors_startup'])),
+            TextInputComponent(id_='mirrors_sort_limit',
+                               label=self.i18n['arch.config.mirrors_sort_limit'],
+                               tooltip=self.i18n['arch.config.mirrors_sort_limit.tip'],
+                               only_int=True,
+                               value=arch_config['mirrors_sort_limit'] if isinstance(arch_config['mirrors_sort_limit'], int) else ''),
+            TextInputComponent(id_='arch_cats_exp',
+                               label=self.i18n['arch.config.categories_exp'],
+                               tooltip=self.i18n['arch.config.categories_exp.tip'],
+                               only_int=True,
+                               capitalize_label=False,
+                               value=arch_config['categories_exp'] if isinstance(arch_config['categories_exp'], int) else ''),
+            TextInputComponent(id_='arch_sugs_exp',
+                               label=self.i18n['arch.config.suggestions_exp'],
+                               tooltip=self.i18n['arch.config.suggestions_exp.tip'],
+                               only_int=True,
+                               capitalize_label=False,
+                               value=arch_config['suggestions_exp'] if isinstance(arch_config['suggestions_exp'], int) else '')
+        ]
+
+        return SettingsView(self, PanelComponent([FormComponent(fields, spaces=False)], id_="repo"), icon_path=get_repo_icon_path())
+
+    def _get_aur_settings(self, arch_config: dict) -> SettingsView:
+        fields = [
             self._gen_bool_selector(id_='aur',
                                     label_key='arch.config.aur',
                                     tooltip_key='arch.config.aur.tip',
                                     value=arch_config['aur'],
-                                    max_width=max_width,
                                     capitalize_label=False),
             self._gen_bool_selector(id_='opts',
                                     label_key='arch.config.optimize',
                                     tooltip_key='arch.config.optimize.tip',
                                     value=bool(arch_config['optimize']),
-                                    label_params=['(AUR)'],
-                                    capitalize_label=False,
-                                    max_width=max_width),
+                                    capitalize_label=False),
             self._gen_bool_selector(id_='rebuild_detector',
                                     label_key='arch.config.aur_rebuild_detector',
                                     tooltip_key='arch.config.aur_rebuild_detector.tip',
                                     value=bool(arch_config['aur_rebuild_detector']),
-                                    label_params=['(AUR)'],
                                     tooltip_params=["'rebuild-detector'"],
-                                    capitalize_label=False,
-                                    max_width=max_width),
+                                    capitalize_label=False),
             self._gen_bool_selector(id_='rebuild_detector_no_bin',
                                     label_key='arch.config.aur_rebuild_detector_no_bin',
                                     label_params=['rebuild-detector'],
                                     tooltip_key='arch.config.aur_rebuild_detector_no_bin.tip',
-                                    tooltip_params=['rebuild-detector', self.i18n['arch.config.aur_rebuild_detector'].format('')],
+                                    tooltip_params=['rebuild-detector',
+                                                    self.i18n['arch.config.aur_rebuild_detector'].format('')],
                                     value=bool(arch_config['aur_rebuild_detector_no_bin']),
-                                    capitalize_label=False,
-                                    max_width=max_width),
-            self._gen_bool_selector(id_='autoprovs',
-                                    label_key='arch.config.automatch_providers',
-                                    tooltip_key='arch.config.automatch_providers.tip',
-                                    value=bool(arch_config['automatch_providers']),
-                                    max_width=max_width),
-            self._gen_bool_selector(id_='check_dependency_breakage',
-                                    label_key='arch.config.check_dependency_breakage',
-                                    tooltip_key='arch.config.check_dependency_breakage.tip',
-                                    value=bool(arch_config['check_dependency_breakage']),
-                                    max_width=max_width),
-            self._gen_bool_selector(id_='mthread_download',
-                                    label_key='arch.config.pacman_mthread_download',
-                                    tooltip_key='arch.config.pacman_mthread_download.tip',
-                                    value=arch_config['repositories_mthread_download'],
-                                    max_width=max_width,
-                                    capitalize_label=True),
-            self._gen_bool_selector(id_='sync_dbs',
-                                    label_key='arch.config.sync_dbs',
-                                    tooltip_key='arch.config.sync_dbs.tip',
-                                    value=bool(arch_config['sync_databases']),
-                                    max_width=max_width),
-            db_sync_start,
-            self._gen_bool_selector(id_='clean_cached',
-                                    label_key='arch.config.clean_cache',
-                                    tooltip_key='arch.config.clean_cache.tip',
-                                    value=bool(arch_config['clean_cached']),
-                                    max_width=max_width),
-            self._gen_bool_selector(id_='suggest_unneeded_uninstall',
-                                    label_key='arch.config.suggest_unneeded_uninstall',
-                                    tooltip_params=['"{}"'.format(self.i18n['arch.config.suggest_optdep_uninstall'])],
-                                    tooltip_key='arch.config.suggest_unneeded_uninstall.tip',
-                                    value=bool(arch_config['suggest_unneeded_uninstall']),
-                                    max_width=max_width),
-            self._gen_bool_selector(id_='suggest_optdep_uninstall',
-                                    label_key='arch.config.suggest_optdep_uninstall',
-                                    tooltip_key='arch.config.suggest_optdep_uninstall.tip',
-                                    value=bool(arch_config['suggest_optdep_uninstall']),
-                                    max_width=max_width),
-            self._gen_bool_selector(id_='ref_mirs',
-                                    label_key='arch.config.refresh_mirrors',
-                                    tooltip_key='arch.config.refresh_mirrors.tip',
-                                    value=bool(arch_config['refresh_mirrors_startup']),
-                                    max_width=max_width),
-            TextInputComponent(id_='mirrors_sort_limit',
-                               label=self.i18n['arch.config.mirrors_sort_limit'],
-                               tooltip=self.i18n['arch.config.mirrors_sort_limit.tip'],
-                               only_int=True,
-                               max_width=max_width,
-                               value=arch_config['mirrors_sort_limit'] if isinstance(arch_config['mirrors_sort_limit'], int) else ''),
-            TextInputComponent(id_='aur_idx_exp',
-                               label=self.i18n['arch.config.aur_idx_exp'] + ' (AUR)',
-                               tooltip=self.i18n['arch.config.aur_idx_exp.tip'],
-                               max_width=max_width,
-                               only_int=True,
-                               capitalize_label=False,
-                               value=arch_config['aur_idx_exp'] if isinstance(arch_config['aur_idx_exp'], int) else ''),
+                                    capitalize_label=False),
             new_select(id_='aur_build_only_chosen',
                        label=self.i18n['arch.config.aur_build_only_chosen'],
                        tip=self.i18n['arch.config.aur_build_only_chosen.tip'],
@@ -2900,7 +3015,6 @@ class ArchManager(SoftwareManager):
                              (self.i18n['ask'].capitalize(), None, None),
                              ],
                        value=arch_config['aur_build_only_chosen'],
-                       max_width=max_width,
                        type_=SelectViewType.RADIO,
                        capitalize_label=False),
             new_select(label=self.i18n['arch.config.edit_aur_pkgbuild'],
@@ -2911,75 +3025,113 @@ class ArchManager(SoftwareManager):
                              (self.i18n['ask'].capitalize(), None, None),
                              ],
                        value=arch_config['edit_aur_pkgbuild'],
-                       max_width=max_width,
                        type_=SelectViewType.RADIO,
                        capitalize_label=False),
             self._gen_bool_selector(id_='aur_remove_build_dir',
                                     label_key='arch.config.aur_remove_build_dir',
                                     tooltip_key='arch.config.aur_remove_build_dir.tip',
                                     value=bool(arch_config['aur_remove_build_dir']),
-                                    max_width=max_width,
                                     capitalize_label=False),
             FileChooserComponent(id_='aur_build_dir',
                                  label=self.i18n['arch.config.aur_build_dir'],
-                                 tooltip=self.i18n['arch.config.aur_build_dir.tip'].format(get_build_dir(arch_config, self.pkgbuilder_user)),
-                                 max_width=max_width,
+                                 tooltip=self.i18n['arch.config.aur_build_dir.tip'].format(
+                                     get_build_dir(arch_config, self.pkgbuilder_user)),
                                  file_path=arch_config['aur_build_dir'],
                                  capitalize_label=False,
                                  directory=True),
-            TextInputComponent(id_='arch_cats_exp',
-                               label=self.i18n['arch.config.categories_exp'],
-                               tooltip=self.i18n['arch.config.categories_exp.tip'],
-                               max_width=max_width,
+            TextInputComponent(id_='aur_idx_exp',
+                               label=self.i18n['arch.config.aur_idx_exp'],
+                               tooltip=self.i18n['arch.config.aur_idx_exp.tip'],
                                only_int=True,
                                capitalize_label=False,
-                               value=arch_config['categories_exp'] if isinstance(arch_config['categories_exp'], int) else ''),
+                               value=arch_config['aur_idx_exp'] if isinstance(arch_config['aur_idx_exp'], int) else '')
         ]
 
-        return PanelComponent([FormComponent(fields, spaces=False, id_='root')])
+        return SettingsView(self, PanelComponent([FormComponent(fields, spaces=False)], id_='aur'),
+                            label='AUR',
+                            icon_path=get_icon_path())
 
-    def save_settings(self, component: PanelComponent) -> Tuple[bool, Optional[List[str]]]:
+    def get_settings(self) -> Optional[Generator[SettingsView, None, None]]:
         arch_config = self.configman.get_config()
+        yield self._get_general_settings(arch_config)
+        yield self._get_aur_settings(arch_config)
 
-        form = component.get_form_component('root')
-        arch_config['repositories'] = form.get_single_select_component('repos').get_selected()
-        arch_config['optimize'] = form.get_single_select_component('opts').get_selected()
-        arch_config['aur_rebuild_detector'] = form.get_single_select_component('rebuild_detector').get_selected()
-        arch_config['aur_rebuild_detector_no_bin'] = form.get_single_select_component('rebuild_detector_no_bin').get_selected()
-        arch_config['sync_databases'] = form.get_single_select_component('sync_dbs').get_selected()
-        arch_config['sync_databases_startup'] = form.get_single_select_component('sync_dbs_start').get_selected()
-        arch_config['clean_cached'] = form.get_single_select_component('clean_cached').get_selected()
-        arch_config['refresh_mirrors_startup'] = form.get_single_select_component('ref_mirs').get_selected()
-        arch_config['mirrors_sort_limit'] = form.get_component('mirrors_sort_limit').get_int_value()
-        arch_config['repositories_mthread_download'] = form.get_component('mthread_download').get_selected()
-        arch_config['automatch_providers'] = form.get_single_select_component('autoprovs').get_selected()
-        arch_config['edit_aur_pkgbuild'] = form.get_single_select_component('edit_aur_pkgbuild').get_selected()
-        arch_config['aur_remove_build_dir'] = form.get_single_select_component('aur_remove_build_dir').get_selected()
-        arch_config['aur_build_dir'] = form.get_component('aur_build_dir').file_path
-        arch_config['aur_build_only_chosen'] = form.get_single_select_component('aur_build_only_chosen').get_selected()
-        arch_config['aur_idx_exp'] = form.get_component('aur_idx_exp').get_int_value()
-        arch_config['check_dependency_breakage'] = form.get_single_select_component('check_dependency_breakage').get_selected()
-        arch_config['suggest_optdep_uninstall'] = form.get_single_select_component('suggest_optdep_uninstall').get_selected()
-        arch_config['suggest_unneeded_uninstall'] = form.get_single_select_component('suggest_unneeded_uninstall').get_selected()
-        arch_config['categories_exp'] = form.get_component('arch_cats_exp').get_int_value()
+    @staticmethod
+    def fill_general_settings(arch_config: dict, form: FormComponent):
+        arch_config['repositories'] = form.get_component('repos', SingleSelectComponent).get_selected()
+        arch_config['sync_databases'] = form.get_component('sync_dbs', SingleSelectComponent).get_selected()
+        arch_config['clean_cached'] = form.get_component('clean_cached', SingleSelectComponent).get_selected()
+        arch_config['refresh_mirrors_startup'] = form.get_component('ref_mirs', SingleSelectComponent).get_selected()
+        arch_config['mirrors_sort_limit'] = form.get_component('mirrors_sort_limit', TextInputComponent).get_int_value()
+        arch_config['automatch_providers'] = form.get_component('autoprovs', SingleSelectComponent).get_selected()
+
+        sync_dbs_startup = form.get_component('sync_dbs_start', SingleSelectComponent).get_selected()
+        arch_config['sync_databases_startup'] = sync_dbs_startup
+
+        mthread_download = form.get_component('mthread_download', SingleSelectComponent).get_selected()
+        arch_config['repositories_mthread_download'] = mthread_download
+
+        prefer_repo_provider = form.get_component('prefer_repo_provider', SingleSelectComponent).get_selected()
+        arch_config['prefer_repository_provider'] = prefer_repo_provider
+
+        check_dep_break = form.get_component('check_dependency_breakage', SingleSelectComponent).get_selected()
+        arch_config['check_dependency_breakage'] = check_dep_break
+
+        sug_opt_dep_uni = form.get_component('suggest_optdep_uninstall', SingleSelectComponent).get_selected()
+        arch_config['suggest_optdep_uninstall'] = sug_opt_dep_uni
+
+        sug_unneeded_uni = form.get_component('suggest_unneeded_uninstall', SingleSelectComponent).get_selected()
+        arch_config['suggest_unneeded_uninstall'] = sug_unneeded_uni
+
+        arch_config['categories_exp'] = form.get_component('arch_cats_exp', TextInputComponent).get_int_value()
+        arch_config['suggestions_exp'] = form.get_component('arch_sugs_exp', TextInputComponent).get_int_value()
+
+    def _fill_aur_settings(self, arch_config: dict, form: FormComponent):
+        arch_config['optimize'] = form.get_component('opts', SingleSelectComponent).get_selected()
+
+        rebuild_detect = form.get_component('rebuild_detector', SingleSelectComponent).get_selected()
+        arch_config['aur_rebuild_detector'] = rebuild_detect
+
+        rebuild_no_bin = form.get_component('rebuild_detector_no_bin', SingleSelectComponent).get_selected()
+        arch_config['aur_rebuild_detector_no_bin'] = rebuild_no_bin
+
+        arch_config['edit_aur_pkgbuild'] = form.get_component('edit_aur_pkgbuild', SingleSelectComponent).get_selected()
+
+        remove_build_dir = form.get_component('aur_remove_build_dir', SingleSelectComponent).get_selected()
+        arch_config['aur_remove_build_dir'] = remove_build_dir
+
+        build_chosen = form.get_component('aur_build_only_chosen', SingleSelectComponent).get_selected()
+        arch_config['aur_build_only_chosen'] = build_chosen
+
+        arch_config['aur_build_dir'] = form.get_component('aur_build_dir', FileChooserComponent).file_path
+        arch_config['aur_idx_exp'] = form.get_component('aur_idx_exp', TextInputComponent).get_int_value()
 
         if not arch_config['aur_build_dir']:
             arch_config['aur_build_dir'] = None
 
-        aur_enabled_select = form.get_single_select_component('aur')
+        aur_enabled_select = form.get_component('aur', SingleSelectComponent)
         arch_config['aur'] = aur_enabled_select.get_selected()
 
         if aur_enabled_select.changed() and arch_config['aur']:
             self.index_aur = AURIndexUpdater(context=self.context, taskman=TaskManager(), arch_config=arch_config)
             self.index_aur.start()
 
+    def save_settings(self, component: PanelComponent) -> Tuple[bool, Optional[List[str]]]:
+        arch_config = self.configman.get_config()
+        form = component.get_component_by_idx(0, FormComponent)
+
+        if component.id == 'repo':
+            self.fill_general_settings(arch_config, form)
+        elif component.id == 'aur':
+            self._fill_aur_settings(arch_config, form)
+
         try:
             self.configman.save_config(arch_config)
             return True, None
-        except:
+        except Exception:
             return False, [traceback.format_exc()]
 
-    def get_upgrade_requirements(self, pkgs: List[ArchPackage], root_password: str, watcher: ProcessWatcher) -> UpgradeRequirements:
+    def get_upgrade_requirements(self, pkgs: List[ArchPackage], root_password: Optional[str], watcher: ProcessWatcher) -> UpgradeRequirements:
         self.aur_client.clean_caches()
         arch_config = self.configman.get_config()
 
@@ -3004,6 +3156,7 @@ class ArchManager(SoftwareManager):
             self._custom_actions = {
                 'sys_up': CustomSoftwareAction(i18n_label_key='arch.custom_action.upgrade_system',
                                                i18n_status_key='arch.custom_action.upgrade_system.status',
+                                               i18n_description_key='arch.custom_action.upgrade_system.desc',
                                                manager_method='upgrade_system',
                                                icon_path=get_icon_path(),
                                                requires_root=True,
@@ -3011,12 +3164,14 @@ class ArchManager(SoftwareManager):
                                                manager=self),
                 'ref_dbs': CustomSoftwareAction(i18n_label_key='arch.custom_action.refresh_dbs',
                                                 i18n_status_key='arch.sync_databases.substatus',
+                                                i18n_description_key='arch.custom_action.refresh_dbs.desc',
                                                 manager_method='sync_databases',
                                                 icon_path=get_icon_path(),
                                                 requires_root=True,
                                                 manager=self),
                 'ref_mirrors': CustomSoftwareAction(i18n_label_key='arch.custom_action.refresh_mirrors',
                                                     i18n_status_key='arch.task.mirrors',
+                                                    i18n_description_key='arch.custom_action.refresh_mirrors.desc',
                                                     manager_method='refresh_mirrors',
                                                     icon_path=get_icon_path(),
                                                     requires_root=True,
@@ -3024,6 +3179,7 @@ class ArchManager(SoftwareManager):
                                                     requires_confirmation=False),
                 'clean_cache': CustomSoftwareAction(i18n_label_key='arch.custom_action.clean_cache',
                                                     i18n_status_key='arch.custom_action.clean_cache.status',
+                                                    i18n_description_key='arch.custom_action.clean_cache.desc',
                                                     manager_method='clean_cache',
                                                     icon_path=get_icon_path(),
                                                     requires_root=True,
@@ -3032,6 +3188,7 @@ class ArchManager(SoftwareManager):
                                                     requires_confirmation=False),
                 'setup_snapd': CustomSoftwareAction(i18n_label_key='arch.custom_action.setup_snapd',
                                                     i18n_status_key='arch.custom_action.setup_snapd.status',
+                                                    i18n_description_key='arch.custom_action.setup_snapd.desc',
                                                     manager_method='setup_snapd',
                                                     icon_path=get_icon_path(),
                                                     requires_root=False,
@@ -3085,7 +3242,7 @@ class ArchManager(SoftwareManager):
                     elif new_size is not None:
                         p.size = new_size - p.size
 
-    def upgrade_system(self, root_password: str, watcher: ProcessWatcher) -> bool:
+    def upgrade_system(self, root_password: Optional[str], watcher: ProcessWatcher) -> bool:
         # repo_map = pacman.map_repositories()
         net_available = self.context.internet_checker.is_available()
         installed = self.read_installed(limit=-1, only_apps=False, pkg_types=None, internet_available=net_available, disk_loader=None).installed
@@ -3160,13 +3317,13 @@ class ArchManager(SoftwareManager):
             watcher.request_reboot(msg)
             return True
 
-    def clean_cache(self, root_password: str, watcher: ProcessWatcher) -> bool:
+    def clean_cache(self, root_password: Optional[str], watcher: ProcessWatcher) -> bool:
 
         cache_dir = pacman.get_cache_dir()
 
         if not cache_dir or not os.path.isdir(cache_dir):
             watcher.show_message(title=self.i18n['arch.custom_action.clean_cache'].capitalize(),
-                                 body=self.i18n['arch.custom_action.clean_cache.no_dir'.format(bold(cache_dir))].capitalize(),
+                                 body=self.i18n['arch.custom_action.clean_cache.no_dir'].format(bold(cache_dir)).capitalize(),
                                  type_=MessageType.WARNING)
             return True
 
@@ -3199,8 +3356,7 @@ class ArchManager(SoftwareManager):
 
         return True
 
-    def _list_ignored_updates(self) -> Set[str]:
-        ignored = set()
+    def _fill_ignored_updates(self, output: Set[str]) -> Set[str]:
         if os.path.exists(UPDATES_IGNORED_FILE):
             with open(UPDATES_IGNORED_FILE) as f:
                 ignored_lines = f.readlines()
@@ -3210,9 +3366,9 @@ class ArchManager(SoftwareManager):
                     line_clean = line.strip()
 
                     if line_clean:
-                        ignored.add(line_clean)
+                        output.add(line_clean)
 
-        return ignored
+        return output
 
     def _write_ignored(self, names: Set[str]):
         Path(ARCH_CONFIG_DIR).mkdir(parents=True, exist_ok=True)
@@ -3227,7 +3383,7 @@ class ArchManager(SoftwareManager):
                 f.write('')
 
     def ignore_update(self, pkg: ArchPackage):
-        ignored = self._list_ignored_updates()
+        ignored = self._fill_ignored_updates(set())
 
         if pkg.name not in ignored:
             ignored.add(pkg.name)
@@ -3236,7 +3392,7 @@ class ArchManager(SoftwareManager):
         pkg.update_ignored = True
 
     def _revert_ignored_updates(self, pkgs: Iterable[str]):
-        ignored = self._list_ignored_updates()
+        ignored = self._fill_ignored_updates(set())
 
         for p in pkgs:
             if p in ignored:
@@ -3259,7 +3415,7 @@ class ArchManager(SoftwareManager):
 
             self._write_editable_pkgbuilds(editable)
             return True
-        except:
+        except Exception:
             traceback.print_exc()
             return False
 
@@ -3280,7 +3436,7 @@ class ArchManager(SoftwareManager):
                     editable.remove(pkgname)
 
                 self._write_editable_pkgbuilds(editable)
-            except:
+            except Exception:
                 traceback.print_exc()
                 return False
 
@@ -3293,15 +3449,15 @@ class ArchManager(SoftwareManager):
 
         return set()
 
-    def enable_pkgbuild_edition(self, pkg: ArchPackage, root_password: str, watcher: ProcessWatcher):
+    def enable_pkgbuild_edition(self, pkg: ArchPackage, root_password: Optional[str], watcher: ProcessWatcher):
         if self._add_as_editable_pkgbuild(pkg.name):
             pkg.pkgbuild_editable = True
 
-    def disable_pkgbuild_edition(self, pkg: ArchPackage, root_password: str, watcher: ProcessWatcher):
+    def disable_pkgbuild_edition(self, pkg: ArchPackage, root_password: Optional[str], watcher: ProcessWatcher):
         if self._remove_from_editable_pkgbuilds(pkg.name):
             pkg.pkgbuild_editable = False
 
-    def setup_snapd(self, root_password: str, watcher: ProcessWatcher) -> bool:
+    def setup_snapd(self, root_password: Optional[str], watcher: ProcessWatcher) -> bool:
         # checking services
         missing_items = []
         for serv, active in system.check_enabled_services('snapd.service', 'snapd.socket').items():
@@ -3483,13 +3639,13 @@ class ArchManager(SoftwareManager):
 
         return res
 
-    def reinstall(self, pkg: ArchPackage, root_password: str, watcher: ProcessWatcher) -> bool:  # only available for AUR packages
+    def reinstall(self, pkg: ArchPackage, root_password: Optional[str], watcher: ProcessWatcher) -> bool:  # only available for AUR packages
         if not self.context.internet_checker.is_available():
             raise NoInternetException()
 
         self.aur_client.clean_caches()
 
-        apidatas = self.aur_client.get_info({pkg.name})
+        apidatas = self.aur_client.get_info((pkg.name,))
 
         if not apidatas:
             watcher.show_message(title=self.i18n['error'],
@@ -3512,7 +3668,7 @@ class ArchManager(SoftwareManager):
                             context=context,
                             disk_loader=self.context.disk_loader_factory.new()).success
 
-    def set_rebuild_check(self, pkg: ArchPackage, root_password: str, watcher: ProcessWatcher) -> bool:
+    def set_rebuild_check(self, pkg: ArchPackage, root_password: Optional[str], watcher: ProcessWatcher) -> bool:
         if pkg.repository != 'aur':
             return False
 
@@ -3523,7 +3679,7 @@ class ArchManager(SoftwareManager):
             else:
                 rebuild_detector.remove_from_ignored(pkg.name)
                 pkg.allow_rebuild = True
-        except:
+        except Exception:
             self.logger.error("An unexpected exception happened")
             traceback.print_exc()
             return False
@@ -3574,3 +3730,153 @@ class ArchManager(SoftwareManager):
                 return added
 
         return True
+
+    def _fill_available_packages(self, output: Dict[str, Set[str]]):
+        output.update(pacman.map_available_packages())
+
+    def _fill_suggestions(self, output: Dict[str, int]):
+        self.suggestions_downloader.register_task(None)
+        suggestions = self.suggestions_downloader.read(self.configman.read_config())
+
+        if suggestions:
+            output.update(suggestions)
+
+    def _fill_cached_if_unset(self, pkg: ArchPackage, loader: DiskCacheLoader):
+        data = loader.read(pkg)
+
+        if data:
+            for attr, cached_val in data.items():
+                if cached_val:
+                    current_val = getattr(pkg, attr)
+
+                    if current_val is None:
+                        setattr(pkg, attr, cached_val)
+
+    def list_suggestions(self, limit: int, filter_installed: bool) -> Optional[List[PackageSuggestion]]:
+        if limit == 0:
+            return
+
+        arch_config = self.configman.get_config()
+
+        if not arch_config['repositories']:
+            return
+
+        name_priority = dict()
+
+        fill_suggestions = Thread(target=self._fill_suggestions, args=(name_priority,))
+        fill_suggestions.start()
+
+        available_packages = dict()
+        fill_available = Thread(target=self._fill_available_packages, args=(available_packages,))
+        fill_available.start()
+
+        ignored_pkgs = set()
+        fill_ignored = Thread(target=pacman.fill_ignored_packages, args=(ignored_pkgs,))
+        fill_ignored.start()
+
+        fill_suggestions.join()
+
+        if not name_priority:
+            self.logger.info("No Arch package suggestions found")
+            return
+
+        self.logger.info(f"Found {len(name_priority)} named Arch package suggestions")
+
+        if fill_available:
+            fill_available.join()
+
+        if not available_packages:
+            self.logger.error("No available Arch package found. It will not be possible to return suggestions")
+            return
+
+        fill_ignored.join()
+
+        available_suggestions = dict()
+
+        for n in name_priority:
+            if n not in ignored_pkgs:
+                data = available_packages.get(n)
+
+                if data and (not filter_installed or not data['i']):
+                    available_suggestions[n] = data
+
+        if not available_suggestions:
+            self.logger.info("No Arch package suggestion to return")
+            return
+
+        if filter_installed:
+            ignored_updates = set()
+            thread_fill_ignored_updates = Thread(target=self._fill_ignored_updates, args=(ignored_updates,))
+            thread_fill_ignored_updates.start()
+        else:
+            ignored_updates, thread_fill_ignored_updates = None, None
+
+        suggestion_by_priority = sort_by_priority({n: name_priority[n] for n in available_suggestions})
+
+        if available_suggestions and 0 < limit < len(available_suggestions):
+            suggestion_by_priority = suggestion_by_priority[0:limit]
+
+        self.logger.info(f'Available Arch package suggestions: {len(suggestion_by_priority)}')
+
+        if thread_fill_ignored_updates:
+            thread_fill_ignored_updates.join()
+
+        full_data = pacman.map_packages(names=suggestion_by_priority, remote=filter_installed, not_signed=False,
+                                        skip_ignored=True)
+
+        if full_data and full_data.get('signed'):
+            full_data = full_data['signed']
+
+        disk_loader, caching_threads = None, None
+        if not filter_installed:
+            disk_loader = self.context.disk_loader_factory.new()
+            caching_threads = list()
+
+        suggestions = []
+        for name in suggestion_by_priority:
+            pkg_data = available_suggestions[name]
+            pkg_full_data = full_data.get(name)
+            description = None
+
+            if pkg_full_data:
+                description = pkg_full_data.get('description')
+
+            pkg_updates_ignored = pkg_data['i'] and ignored_updates and name in ignored_updates
+            pkg = ArchPackage(name=name,
+                              version=pkg_data['v'],
+                              latest_version=pkg_data['v'],
+                              repository=pkg_data['r'],
+                              installed=pkg_data['i'],
+                              description=description,
+                              categories=self.categories.get(name),
+                              i18n=self.i18n,
+                              maintainer=pkg_data['r'],
+                              update_ignored=pkg_updates_ignored)
+
+            if disk_loader:
+                t = Thread(target=self._fill_cached_if_unset, args=(pkg, disk_loader))
+                t.start()
+                caching_threads.append(t)
+
+            suggestions.append(PackageSuggestion(package=pkg, priority=name_priority[name]))
+
+        if caching_threads:
+            for t in caching_threads:
+                t.join()
+
+        return suggestions
+
+    @property
+    def suggestions_downloader(self) -> RepositorySuggestionsDownloader:
+        if not self._suggestions_downloader:
+            file_url = self.context.get_suggestion_url(self.__module__)
+
+            self._suggestions_downloader = RepositorySuggestionsDownloader(logger=self.logger,
+                                                                           http_client=self.http_client,
+                                                                           i18n=self.i18n,
+                                                                           file_url=file_url)
+
+            if self._suggestions_downloader.is_custom_local_file_mapped():
+                self.logger.info(f"Local Arch suggestions file mapped: {file_url}")
+
+        return self._suggestions_downloader

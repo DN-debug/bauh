@@ -23,10 +23,13 @@ from bauh.api.exception import NoInternetException
 from bauh.api.paths import LOGS_DIR
 from bauh.commons.html import bold
 from bauh.commons.internet import InternetChecker
-from bauh.commons.system import get_human_size_str, ProcessHandler, SimpleProcess
+from bauh.commons.system import ProcessHandler, SimpleProcess
+from bauh.commons.view_utils import get_human_size_str
 from bauh.view.core import timeshift
-from bauh.view.core.config import CoreConfigManager
+from bauh.view.core.config import CoreConfigManager, BACKUP_REMOVE_METHODS, BACKUP_DEFAULT_REMOVE_METHOD
 from bauh.view.qt import commons
+from bauh.view.qt.commons import sort_packages
+from bauh.view.qt.qt_utils import get_current_screen_geometry
 from bauh.view.qt.view_model import PackageView, PackageViewStatus
 from bauh.view.util.translation import I18n
 
@@ -45,8 +48,9 @@ class AsyncAction(QThread, ProcessWatcher):
     signal_root_password = pyqtSignal()
     signal_progress_control = pyqtSignal(bool)
 
-    def __init__(self, root_password: Optional[Tuple[bool, str]] = None):
+    def __init__(self, i18n: I18n, root_password: Optional[Tuple[bool, str]] = None):
         super(AsyncAction, self).__init__()
+        self.i18n = i18n
         self.wait_confirmation = False
         self.confirmation_res = None
         self.root_password = root_password
@@ -55,12 +59,16 @@ class AsyncAction(QThread, ProcessWatcher):
     def request_confirmation(self, title: str, body: str, components: List[ViewComponent] = None,
                              confirmation_label: str = None, deny_label: str = None, deny_button: bool = True,
                              window_cancel: bool = False,
-                             confirmation_button: bool = True) -> bool:
+                             confirmation_button: bool = True,
+                             min_width: Optional[int] = None,
+                             min_height: Optional[int] = None,
+                             max_width: Optional[int] = None) -> bool:
         self.wait_confirmation = True
         self.signal_confirmation.emit({'title': title, 'body': body, 'components': components,
                                        'confirmation_label': confirmation_label, 'deny_label': deny_label,
                                        'deny_button': deny_button, 'window_cancel': window_cancel,
-                                       'confirmation_button': confirmation_button})
+                                       'confirmation_button': confirmation_button, 'min_width': min_width,
+                                       'min_height': min_height, 'max_width': max_width})
         self.wait_user()
         return self.confirmation_res
 
@@ -124,35 +132,55 @@ class AsyncAction(QThread, ProcessWatcher):
 
         return False
 
-    def _generate_backup(self, app_config: dict, i18n: I18n, root_password: Optional[str]) -> bool:
+    def _generate_backup(self, app_config: dict, root_password: Optional[str]) -> bool:
         if app_config['backup']['mode'] not in ('only_one', 'incremental'):
             self.show_message(title=self.i18n['error'].capitalize(),
-                              body='{}: {}'.format(self.i18n['action.backup.invalid_mode'],bold(app_config['backup']['mode'])),
+                              body='{}: {}'.format(self.i18n['action.backup.invalid_mode'], bold(app_config['backup']['mode'])),
                               type_=MessageType.ERROR)
             self.change_substatus('')
             return False
 
         handler = ProcessHandler(self)
         if app_config['backup']['mode'] == 'only_one':
-            self.change_substatus('[{}] {}'.format(i18n['core.config.tab.backup'].lower(), i18n['action.backup.substatus.delete']))
-            deleted, _ = handler.handle_simple(timeshift.delete_all_snapshots(root_password))
+            remove_method = app_config['backup']['remove_method']
 
-            if not deleted and not self.request_confirmation(title=i18n['core.config.tab.backup'],
-                                                             body='{}. {}'.format(i18n['action.backup.error.delete'],
-                                                                                  i18n['action.backup.error.proceed']),
-                                                             confirmation_label=i18n['yes'].capitalize(),
-                                                             deny_label=i18n['no'].capitalize()):
+            if remove_method not in BACKUP_REMOVE_METHODS:
+                remove_method = BACKUP_DEFAULT_REMOVE_METHOD
+
+            delete_failed = False
+
+            if remove_method == 'self':
+                previous_snapshots = tuple(timeshift.read_created_snapshots(root_password))
+
+                if previous_snapshots:
+                    substatus = f"[{self.i18n['core.config.tab.backup'].lower()}] {self.i18n['action.backup.substatus.delete']}"
+                    self.change_substatus(substatus)
+
+                    for snapshot in reversed(previous_snapshots):
+                        deleted, _ = handler.handle_simple(timeshift.delete(snapshot, root_password))
+
+                        if not deleted:
+                            delete_failed = True
+            else:
+                deleted, _ = handler.handle_simple(timeshift.delete_all_snapshots(root_password))
+                delete_failed = not deleted
+
+            if delete_failed and not self.request_confirmation(title=self.i18n['core.config.tab.backup'],
+                                                               body=f"{self.i18n['action.backup.error.delete']}. "
+                                                                    f"{self.i18n['action.backup.error.proceed']}",
+                                                               confirmation_label=self.i18n['yes'].capitalize(),
+                                                               deny_label=self.i18n['no'].capitalize()):
                 self.change_substatus('')
                 return False
 
-        self.change_substatus('[{}] {}'.format(i18n['core.config.tab.backup'].lower(), i18n['action.backup.substatus.create']))
+        self.change_substatus('[{}] {}'.format(self.i18n['core.config.tab.backup'].lower(), self.i18n['action.backup.substatus.create']))
         created, _ = handler.handle_simple(timeshift.create_snapshot(root_password, app_config['backup']['type']))
 
-        if not created and not self.request_confirmation(title=i18n['core.config.tab.backup'],
-                                                         body='{}. {}'.format(i18n['action.backup.error.create'],
-                                                                              i18n['action.backup.error.proceed']),
-                                                         confirmation_label=i18n['yes'].capitalize(),
-                                                         deny_label=i18n['no'].capitalize()):
+        if not created and not self.request_confirmation(title=self.i18n['core.config.tab.backup'],
+                                                         body='{}. {}'.format(self.i18n['action.backup.error.create'],
+                                                                              self.i18n['action.backup.error.proceed']),
+                                                         confirmation_label=self.i18n['yes'].capitalize(),
+                                                         deny_label=self.i18n['no'].capitalize()):
             self.change_substatus('')
             return False
 
@@ -168,24 +196,24 @@ class AsyncAction(QThread, ProcessWatcher):
 
         return bool(app_config['backup']['enabled']) and timeshift.is_available()
 
-    def _should_backup(self, action_key: str, app_config: dict, i18n: I18n) -> bool:
+    def _should_backup(self, action_key: str, app_config: dict) -> bool:
         # backup -> true: do not ask, only execute | false: do not ask or execute | None: ask
         backup = app_config['backup'][action_key] if action_key else None
 
         if backup is None:
-            return self.request_confirmation(title=i18n['core.config.tab.backup'],
-                                             body=i18n['action.backup.msg'],
-                                             confirmation_label=i18n['yes'].capitalize(),
-                                             deny_label=i18n['no'].capitalize())
+            return self.request_confirmation(title=self.i18n['core.config.tab.backup'],
+                                             body=self.i18n['action.backup.msg'],
+                                             confirmation_label=self.i18n['yes'].capitalize(),
+                                             deny_label=self.i18n['no'].capitalize())
         else:
             return backup
 
-    def request_backup(self, action_key: Optional[str], pkg: Optional[PackageView], i18n: I18n, app_config: dict, root_password: Optional[str], backup_only: bool = False) -> Tuple[bool, Optional[str]]:
+    def request_backup(self, action_key: Optional[str], pkg: Optional[PackageView], app_config: dict, root_password: Optional[str], backup_only: bool = False) -> Tuple[bool, Optional[str]]:
         if not backup_only:
             if not self._check_backup_requirements(app_config=app_config, pkg=pkg, action_key=action_key):
                 return True, root_password
 
-            if not self._should_backup(action_key=action_key, app_config=app_config, i18n=i18n):
+            if not self._should_backup(action_key=action_key, app_config=app_config):
                 return True, root_password
 
         pwd = root_password
@@ -195,7 +223,7 @@ class AsyncAction(QThread, ProcessWatcher):
             if not valid_password:
                 return False, None
 
-        return self._generate_backup(app_config=app_config, i18n=i18n, root_password=pwd), pwd
+        return self._generate_backup(app_config=app_config, root_password=pwd), pwd
 
 
 class UpgradeSelected(AsyncAction):
@@ -203,14 +231,16 @@ class UpgradeSelected(AsyncAction):
     UPGRADE_LOGS_DIR = f'{LOGS_DIR}/upgrade'
     SUMMARY_FILE = UPGRADE_LOGS_DIR + '/{}_summary.txt'
 
-    def __init__(self, manager: SoftwareManager, internet_checker: InternetChecker, i18n: I18n, pkgs: List[PackageView] = None):
-        super(UpgradeSelected, self).__init__()
+    def __init__(self, manager: SoftwareManager, internet_checker: InternetChecker, i18n: I18n,
+                 parent_widget: QWidget, pkgs: List[PackageView] = None):
+        super(UpgradeSelected, self).__init__(i18n=i18n)
         self.pkgs = pkgs
         self.manager = manager
-        self.i18n = i18n
         self.internet_checker = internet_checker
+        self._parent_widget = parent_widget
 
-    def _req_as_option(self, req: UpgradeRequirement, tooltip: bool = True, custom_tooltip: str = None, required_size: bool = True, display_sizes: bool = True) -> InputOption:
+    def _req_as_option(self, req: UpgradeRequirement, tooltip: bool = True, custom_tooltip: str = None, required_size: bool = True, display_sizes: bool = True,
+                       positive_size_symbol: bool = False) -> InputOption:
         if req.pkg.installed:
             icon_path = req.pkg.get_disk_icon_path()
 
@@ -224,17 +254,16 @@ class UpgradeSelected(AsyncAction):
 
         size_str = None
         if display_sizes:
-            size_str = '{}: {}'.format(self.i18n['size'].capitalize(),
-                                       '?' if req.extra_size is None else get_human_size_str(req.extra_size))
+            storage_size = '?' if req.extra_size is None else get_human_size_str(req.extra_size, positive_size_symbol)
+            size_str = f"{self.i18n['action.update.storage_size']}: {storage_size}"
             if required_size and req.extra_size != req.required_size:
-                size_str += ' ( {}: {} )'.format(self.i18n['action.update.pkg.required_size'].capitalize(),
-                                                 '?' if req.required_size is None else get_human_size_str(req.required_size))
+                download_size = '?' if req.required_size is None else get_human_size_str(req.required_size)
+                size_str += f" ({self.i18n['action.update.download_size']}: {download_size})"
 
-        label = '{}{}'.format(req.pkg.name,
-                              ' ( {} )'.format(req.pkg.latest_version) if req.pkg.latest_version else '')
+        label = f"{req.pkg.name} {f' ({req.pkg.latest_version})' if req.pkg.latest_version else ''}"
 
         if size_str:
-            label += ' - {}'.format(size_str)
+            label += f' | {size_str}'
 
         return InputOption(label=label,
                            value=None,
@@ -242,7 +271,7 @@ class UpgradeSelected(AsyncAction):
                            read_only=True,
                            icon_path=icon_path)
 
-    def _sum_pkgs_size(self, reqs: List[UpgradeRequirement]) -> Tuple[int, int]:
+    def _sum_pkgs_size(self, reqs: List[UpgradeRequirement]) -> Tuple[float, float]:
         required, extra = 0, 0
         for r in reqs:
             if r.required_size is not None:
@@ -258,21 +287,21 @@ class UpgradeSelected(AsyncAction):
         opts = [self._req_as_option(req=r, tooltip=False, custom_tooltip=r.reason, display_sizes=False) for r in reqs]
         comps = [MultipleSelectComponent(label='', options=opts, default_options=set(opts))]
 
-        return FormComponent(label='{} ( {}: {} )'.format(self.i18n['action.update.cannot_update_label'],
-                                                          self.i18n['amount'].capitalize(), len(opts)),
+        return FormComponent(label='{} ({}: {})'.format(self.i18n['action.update.cannot_update_label'],
+                                                        self.i18n['amount'].capitalize(), len(opts)),
                              components=comps)
 
     def _gen_to_install_form(self, reqs: List[UpgradeRequirement]) -> Tuple[FormComponent, Tuple[int, int]]:
-        opts = [self._req_as_option(r, custom_tooltip=r.reason) for r in reqs]
+        opts = [self._req_as_option(r, custom_tooltip=r.reason, positive_size_symbol=True) for r in reqs]
         comps = [MultipleSelectComponent(label='', options=opts, default_options=set(opts))]
         required_size, extra_size = self._sum_pkgs_size(reqs)
 
-        lb = '{} ( {}: {}. {}: {}. {}: {} )'.format(self.i18n['action.update.required_label'].capitalize(),
+        lb = '{} ({}: {} | {}: {} | {}: {})'.format(self.i18n['action.update.required_label'].capitalize(),
                                                     self.i18n['amount'].capitalize(),
                                                     len(opts),
-                                                    self.i18n['size'].capitalize(),
-                                                    '?' if extra_size is None else get_human_size_str(extra_size),
-                                                    self.i18n['action.update.pkg.required_size'].capitalize(),
+                                                    self.i18n['action.update.storage_size'],
+                                                    '?' if extra_size is None else get_human_size_str(extra_size, True),
+                                                    self.i18n['action.update.download_size'],
                                                     '?' if required_size is None else get_human_size_str(required_size))
         return FormComponent(label=lb, components=comps), (required_size, extra_size)
 
@@ -281,24 +310,24 @@ class UpgradeSelected(AsyncAction):
         comps = [MultipleSelectComponent(label='', options=opts, default_options=set(opts))]
         required_size, extra_size = self._sum_pkgs_size(reqs)
 
-        lb = '{} ( {}: {}. {}: {} )'.format(self.i18n['action.update.label_to_remove'].capitalize(),
-                                            self.i18n['amount'].capitalize(),
-                                            len(opts),
-                                            self.i18n['size'].capitalize(),
-                                            '?' if extra_size is None else get_human_size_str(-extra_size))
+        lb = '{} ({}: {} | {}: {})'.format(self.i18n['action.update.label_to_remove'].capitalize(),
+                                           self.i18n['amount'].capitalize(),
+                                           len(opts),
+                                           self.i18n['action.update.storage_size'],
+                                           '?' if extra_size is None else get_human_size_str(-extra_size))
         return FormComponent(label=lb, components=comps)
 
     def _gen_to_update_form(self, reqs: List[UpgradeRequirement]) -> Tuple[FormComponent, Tuple[int, int]]:
-        opts = [self._req_as_option(r, tooltip=False) for r in reqs]
+        opts = [self._req_as_option(r, tooltip=False, positive_size_symbol=True) for r in reqs]
         comps = [MultipleSelectComponent(label='', options=opts, default_options=set(opts))]
         required_size, extra_size = self._sum_pkgs_size(reqs)
 
-        lb = '{} ( {}: {}. {}: {}. {}: {} )'.format(self.i18n['action.update.label_to_upgrade'].capitalize(),
+        lb = '{} ({}: {} | {}: {} | {}: {})'.format(self.i18n['action.update.label_to_upgrade'].capitalize(),
                                                     self.i18n['amount'].capitalize(),
                                                     len(opts),
-                                                    self.i18n['size'].capitalize(),
-                                                    '?' if extra_size is None else get_human_size_str(extra_size),
-                                                    self.i18n['action.update.pkg.required_size'].capitalize(),
+                                                    self.i18n['action.update.storage_size'],
+                                                    '?' if extra_size is None else get_human_size_str(extra_size, True),
+                                                    self.i18n['action.update.download_size'],
                                                     '?' if required_size is None else get_human_size_str(required_size))
 
         return FormComponent(label=lb, components=comps), (required_size, extra_size)
@@ -317,7 +346,7 @@ class UpgradeSelected(AsyncAction):
     def _ask_for_trim(self) -> bool:
         return self.request_confirmation(title=self.i18n['confirmation'].capitalize(), body=self.i18n['action.trim_disk.ask'])
 
-    def _trim_disk(self, root_password: str):
+    def _trim_disk(self, root_password: Optional[str]):
         self.change_status('{}...'.format(self.i18n['action.disk_trim'].capitalize()))
         self.change_substatus('')
 
@@ -385,7 +414,7 @@ class UpgradeSelected(AsyncAction):
             with open(self.SUMMARY_FILE.format(upgrade_id), 'w+') as f:
                 f.write(summary_text.read())
 
-        except:
+        except Exception:
             traceback.print_exc()
 
     def _handle_internet_off(self):
@@ -461,15 +490,16 @@ class UpgradeSelected(AsyncAction):
             extra_size += updates_size[1]
             comps.append(updates_form)
 
-        extra_size_text = '{}: {}'.format(self.i18n['action.update.total_size'].capitalize(), get_human_size_str(extra_size))
-        req_size_text = '{}: {}'.format(self.i18n['action.update.required_size'].capitalize(),
-                                        get_human_size_str(required_size))
-        comps.insert(0, TextComponent('{}  |  {}'.format(extra_size_text, req_size_text), size=14))
+        disc_size_text = f"{self.i18n['action.update.total_storage_size']}: {get_human_size_str(extra_size, True)}"
+        download_size_text = f"{self.i18n['action.update.download_size']}: {get_human_size_str(required_size)}"
+
+        comps.insert(0, TextComponent(f'{disc_size_text} ({download_size_text})', size=14))
         comps.insert(1, TextComponent(''))
 
+        screen_width = get_current_screen_geometry(self._parent_widget).width()
         if not self.request_confirmation(title=self.i18n['action.update.summary'].capitalize(), body='', components=comps,
                                          confirmation_label=self.i18n['proceed'].capitalize(), deny_label=self.i18n['cancel'].capitalize(),
-                                         confirmation_button=can_upgrade):
+                                         confirmation_button=can_upgrade, min_width=int(0.45 * screen_width)):
             self.notify_finished({'success': success, 'updated': updated, 'types': updated_types, 'id': None})
             self.pkgs = None
             return
@@ -484,7 +514,7 @@ class UpgradeSelected(AsyncAction):
         # backup dialog ( if enabled, supported and accepted )
         should_backup = bkp_supported
         should_backup = should_backup and self._check_backup_requirements(app_config=app_config, pkg=None, action_key='upgrade')
-        should_backup = should_backup and self._should_backup(action_key='upgrade', app_config=app_config, i18n=self.i18n)
+        should_backup = should_backup and self._should_backup(action_key='upgrade', app_config=app_config)
 
         # trim dialog ( if enabled and accepted )
         if app_config['disk']['trim']['after_upgrade'] is not False:
@@ -504,7 +534,6 @@ class UpgradeSelected(AsyncAction):
         if should_backup:
             proceed, root_password = self.request_backup(action_key='upgrade',
                                                          app_config=app_config,
-                                                         i18n=self.i18n,
                                                          root_password=root_password,
                                                          pkg=None,
                                                          backup_only=True)
@@ -524,8 +553,9 @@ class UpgradeSelected(AsyncAction):
         self.change_substatus('')
 
         if success:
-            updated = len(requirements.to_upgrade)
-            updated_types.update((req.pkg.__class__ for req in requirements.to_upgrade))
+            if requirements.to_upgrade:
+                updated = len(requirements.to_upgrade)
+                updated_types.update((req.pkg.__class__ for req in requirements.to_upgrade))
 
             if should_trim:
                 self._trim_disk(root_password)
@@ -542,8 +572,8 @@ class UpgradeSelected(AsyncAction):
 
 class RefreshApps(AsyncAction):
 
-    def __init__(self, manager: SoftwareManager, pkg_types: Set[Type[SoftwarePackage]] = None):
-        super(RefreshApps, self).__init__()
+    def __init__(self, i18n: I18n, manager: SoftwareManager, pkg_types: Set[Type[SoftwarePackage]] = None):
+        super(RefreshApps, self).__init__(i18n=i18n)
         self.manager = manager
         self.pkg_types = pkg_types
 
@@ -562,7 +592,7 @@ class RefreshApps(AsyncAction):
                 refreshed_types = self.pkg_types
 
             self.notify_finished({'installed': res.installed, 'total': res.total, 'types': refreshed_types})
-        except:
+        except Exception:
             traceback.print_exc()
             self.notify_finished({'installed': [], 'total': 0, 'types': set()})
         finally:
@@ -572,18 +602,16 @@ class RefreshApps(AsyncAction):
 class UninstallPackage(AsyncAction):
 
     def __init__(self, manager: SoftwareManager, icon_cache: MemoryCache, i18n: I18n, pkg: PackageView = None):
-        super(UninstallPackage, self).__init__()
+        super(UninstallPackage, self).__init__(i18n=i18n)
         self.pkg = pkg
         self.manager = manager
         self.icon_cache = icon_cache
         self.root_pwd = None
-        self.i18n = i18n
 
     def run(self):
         if self.pkg:
             proceed, _ = self.request_backup(action_key='uninstall',
                                              pkg=self.pkg,
-                                             i18n=self.i18n,
                                              root_password=self.root_pwd,
                                              app_config=CoreConfigManager().get_config())
             if not proceed:
@@ -603,7 +631,7 @@ class UninstallPackage(AsyncAction):
                         self.manager.clean_cache_for(p)
 
                 self.notify_finished({'success': res.success, 'removed': res.removed, 'pkg': self.pkg})
-            except:
+            except Exception:
                 traceback.print_exc()
                 self.notify_finished({'success': False, 'removed': None, 'pkg': self.pkg})
             finally:
@@ -614,10 +642,9 @@ class UninstallPackage(AsyncAction):
 class DowngradePackage(AsyncAction):
 
     def __init__(self, manager: SoftwareManager, i18n: I18n, pkg: PackageView = None):
-        super(DowngradePackage, self).__init__()
+        super(DowngradePackage, self).__init__(i18n=i18n)
         self.manager = manager
         self.pkg = pkg
-        self.i18n = i18n
         self.root_pwd = None
 
     def run(self):
@@ -626,7 +653,6 @@ class DowngradePackage(AsyncAction):
 
             proceed, _ = self.request_backup(action_key='downgrade',
                                              pkg=self.pkg,
-                                             i18n=self.i18n,
                                              root_password=self.root_pwd,
                                              app_config=CoreConfigManager().get_config())
 
@@ -649,8 +675,8 @@ class DowngradePackage(AsyncAction):
 
 class ShowPackageInfo(AsyncAction):
 
-    def __init__(self, manager: SoftwareManager, pkg: PackageView = None):
-        super(ShowPackageInfo, self).__init__()
+    def __init__(self, i18n: I18n, manager: SoftwareManager, pkg: PackageView = None):
+        super(ShowPackageInfo, self).__init__(i18n=i18n)
         self.pkg = pkg
         self.manager = manager
 
@@ -670,10 +696,9 @@ class ShowPackageInfo(AsyncAction):
 class ShowPackageHistory(AsyncAction):
 
     def __init__(self, manager: SoftwareManager, i18n: I18n, pkg: PackageView = None):
-        super(ShowPackageHistory, self).__init__()
+        super(ShowPackageHistory, self).__init__(i18n=i18n)
         self.pkg = pkg
         self.manager = manager
-        self.i18n = i18n
 
     def run(self):
         if self.pkg:
@@ -687,8 +712,8 @@ class ShowPackageHistory(AsyncAction):
 
 class SearchPackages(AsyncAction):
 
-    def __init__(self, manager: SoftwareManager):
-        super(SearchPackages, self).__init__()
+    def __init__(self, i18n: I18n, manager: SoftwareManager):
+        super(SearchPackages, self).__init__(i18n=i18n)
         self.word = None
         self.manager = manager
 
@@ -698,8 +723,7 @@ class SearchPackages(AsyncAction):
         if self.word:
             try:
                 res = self.manager.search(words=self.word, disk_loader=None, limit=-1, is_url=False)
-                search_res['pkgs_found'].extend(res.installed)
-                search_res['pkgs_found'].extend(res.new)
+                search_res['pkgs_found'] = sort_packages((*(res.installed or ()), *(res.new or ())), self.word)
             except NoInternetException:
                 search_res['error'] = 'internet.required'
             finally:
@@ -710,11 +734,10 @@ class SearchPackages(AsyncAction):
 class InstallPackage(AsyncAction):
 
     def __init__(self, manager: SoftwareManager, icon_cache: MemoryCache, i18n: I18n, pkg: PackageView = None):
-        super(InstallPackage, self).__init__()
+        super(InstallPackage, self).__init__(i18n=i18n)
         self.pkg = pkg
         self.manager = manager
         self.icon_cache = icon_cache
-        self.i18n = i18n
         self.root_pwd = None
 
     def run(self):
@@ -723,7 +746,6 @@ class InstallPackage(AsyncAction):
 
             proceed, _ = self.request_backup(action_key='install',
                                              pkg=self.pkg,
-                                             i18n=self.i18n,
                                              root_password=self.root_pwd,
                                              app_config=CoreConfigManager().get_config())
 
@@ -888,8 +910,8 @@ class NotifyInstalledLoaded(QThread):
 
 class FindSuggestions(AsyncAction):
 
-    def __init__(self, man: SoftwareManager):
-        super(FindSuggestions, self).__init__()
+    def __init__(self, i18n: I18n, man: SoftwareManager):
+        super(FindSuggestions, self).__init__(i18n=i18n)
         self.man = man
         self.filter_installed = False
 
@@ -915,8 +937,8 @@ class ListWarnings(QThread):
 
 class LaunchPackage(AsyncAction):
 
-    def __init__(self, manager: SoftwareManager, pkg: PackageView = None):
-        super(LaunchPackage, self).__init__()
+    def __init__(self, i18n: I18n, manager: SoftwareManager, pkg: PackageView = None):
+        super(LaunchPackage, self).__init__(i18n=i18n)
         self.pkg = pkg
         self.manager = manager
 
@@ -926,7 +948,7 @@ class LaunchPackage(AsyncAction):
                 super(LaunchPackage, self).msleep(250)
                 self.manager.launch(self.pkg.model)
                 self.notify_finished(True)
-            except:
+            except Exception:
                 traceback.print_exc()
             finally:
                 self.notify_finished(False)
@@ -936,56 +958,14 @@ class ApplyFilters(AsyncAction):
 
     signal_table = pyqtSignal(object)
 
-    def __init__(self, filters: dict = None, pkgs: List[PackageView] = None):
-        super(ApplyFilters, self).__init__()
+    def __init__(self, i18n: I18n, filters: dict = None, pkgs: List[PackageView] = None):
+        super(ApplyFilters, self).__init__(i18n=i18n)
         self.pkgs = pkgs
         self.filters = filters
         self.wait_table_update = False
 
     def stop_waiting(self):
         self.wait_table_update = False
-
-    def _sort_by_word(self, word: str, pkgs: List[PackageView], limit: int) -> List[PackageView]:
-        norm_word = word.strip().lower()
-        exact_installed, exact_not_installed = [], []
-        starts_installed, starts_not_installed = [], []
-        contains_installed, contains_not_installed = [], []
-
-        for p in pkgs:
-            lower_name = p.model.name.lower()
-
-            if norm_word == lower_name:
-                if p.model.installed:
-                    exact_installed.append(p)
-                else:
-                    exact_not_installed.append(p)
-            elif lower_name.startswith(norm_word):
-                if p.model.installed:
-                    starts_installed.append(p)
-                else:
-                    starts_not_installed.append(p)
-            else:
-                if p.model.installed:
-                    contains_installed.append(p)
-                else:
-                    contains_not_installed.append(p)
-
-        res = []
-        for matches in (exact_installed, exact_not_installed,
-                        starts_installed, starts_not_installed,
-                        contains_installed, contains_not_installed):
-            if matches:
-                matches.sort(key=lambda p: p.model.name.lower())
-
-                if limit:
-                    res.extend(matches[0:limit - len(res)])
-
-                    if len(res) == limit:
-                        break
-                else:
-                    res.extend(matches)
-
-        return res
 
     def run(self):
         if self.pkgs:
@@ -998,9 +978,9 @@ class ApplyFilters(AsyncAction):
                 commons.apply_filters(pkgv, self.filters, pkgs_info, limit=not name_filtering)
 
             if name_filtering and pkgs_info['pkgs_displayed']:
-                pkgs_info['pkgs_displayed'] = self._sort_by_word(word=self.filters['name'],
-                                                                 pkgs=pkgs_info['pkgs_displayed'],
-                                                                 limit=self.filters['display_limit'])
+                pkgs_info['pkgs_displayed'] = sort_packages(word=self.filters['name'],
+                                                            pkgs=pkgs_info['pkgs_displayed'],
+                                                            limit=self.filters['display_limit'])
 
             self.wait_table_update = True
             self.signal_table.emit(pkgs_info)
@@ -1013,13 +993,12 @@ class ApplyFilters(AsyncAction):
 
 class CustomAction(AsyncAction):
 
-    def __init__(self, manager: SoftwareManager, i18n: I18n, custom_action: CustomSoftwareAction = None, pkg: PackageView = None, root_password: str = None):
-        super(CustomAction, self).__init__()
+    def __init__(self, manager: SoftwareManager, i18n: I18n, custom_action: CustomSoftwareAction = None, pkg: PackageView = None, root_password: Optional[str] = None):
+        super(CustomAction, self).__init__(i18n=i18n)
         self.manager = manager
         self.pkg = pkg
         self.custom_action = custom_action
         self.root_pwd = root_password
-        self.i18n = i18n
 
     def run(self):
         res = {'success': False, 'pkg': self.pkg, 'action': self.custom_action, 'error': None, 'error_type': MessageType.ERROR}
@@ -1027,7 +1006,6 @@ class CustomAction(AsyncAction):
         if self.custom_action.backup:
             proceed, _ = self.request_backup(app_config=CoreConfigManager().get_config(),
                                              action_key=None,
-                                             i18n=self.i18n,
                                              root_password=self.root_pwd,
                                              pkg=self.pkg)
             if not proceed:
@@ -1056,22 +1034,22 @@ class CustomAction(AsyncAction):
 
 class ShowScreenshots(AsyncAction):
 
-    def __init__(self, manager: SoftwareManager, pkg: PackageView = None):
-        super(ShowScreenshots, self).__init__()
+    def __init__(self, i18n: I18n, manager: SoftwareManager, pkg: PackageView = None):
+        super(ShowScreenshots, self).__init__(i18n=i18n)
         self.pkg = pkg
         self.manager = manager
 
     def run(self):
         if self.pkg:
-            self.notify_finished({'pkg': self.pkg, 'screenshots': self.manager.get_screenshots(self.pkg.model)})
+            self.notify_finished({'pkg': self.pkg, 'screenshots': tuple(self.manager.get_screenshots(self.pkg.model))})
 
         self.pkg = None
 
 
 class IgnorePackageUpdates(AsyncAction):
 
-    def __init__(self, manager: SoftwareManager, pkg: PackageView = None):
-        super(IgnorePackageUpdates, self).__init__()
+    def __init__(self, i18n: I18n, manager: SoftwareManager, pkg: PackageView = None):
+        super(IgnorePackageUpdates, self).__init__(i18n=i18n)
         self.pkg = pkg
         self.manager = manager
 
@@ -1105,7 +1083,7 @@ class SaveTheme(QThread):
 
             try:
                 configman.save_config(core_config)
-            except:
+            except Exception:
                 traceback.print_exc()
 
 

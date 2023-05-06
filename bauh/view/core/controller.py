@@ -1,21 +1,23 @@
+import os
 import re
 import shutil
 import time
 import traceback
 from subprocess import Popen, STDOUT
 from threading import Thread
-from typing import List, Set, Type, Tuple, Dict, Optional, Generator, Callable
+from typing import List, Set, Type, Tuple, Dict, Optional, Generator, Callable, Pattern
 
 from bauh.api.abstract.controller import SoftwareManager, SearchResult, ApplicationContext, UpgradeRequirements, \
-    UpgradeRequirement, TransactionResult, SoftwareAction
+    UpgradeRequirement, TransactionResult, SoftwareAction, SettingsView, SettingsController
 from bauh.api.abstract.disk import DiskCacheLoader
 from bauh.api.abstract.handler import ProcessWatcher, TaskManager
 from bauh.api.abstract.model import SoftwarePackage, PackageUpdate, PackageHistory, PackageSuggestion, \
     CustomSoftwareAction
-from bauh.api.abstract.view import ViewComponent, TabGroupComponent, MessageType
+from bauh.api.abstract.view import ViewComponent, TabGroupComponent, MessageType, PanelComponent
 from bauh.api.exception import NoInternetException
 from bauh.commons.boot import CreateConfigFile
 from bauh.commons.html import bold
+from bauh.commons.util import sanitize_command_input
 from bauh.view.core.config import CoreConfigManager
 from bauh.view.core.settings import GenericSettingsManager
 from bauh.view.core.update import check_for_update
@@ -36,10 +38,11 @@ class GenericUpgradeRequirements(UpgradeRequirements):
         self.sub_requirements = sub_requirements
 
 
-class GenericSoftwareManager(SoftwareManager):
+class GenericSoftwareManager(SoftwareManager, SettingsController):
 
     def __init__(self, managers: List[SoftwareManager], context: ApplicationContext, config: dict,
-                 settings_manager: GenericSettingsManager = None):
+                 force_suggestions: bool = False):
+
         super(GenericSoftwareManager, self).__init__(context=context)
         self.managers = managers
         self.map = {t: m for m in self.managers for t in m.get_managed_types()}
@@ -51,24 +54,42 @@ class GenericSoftwareManager(SoftwareManager):
         self._already_prepared = []
         self.working_managers = []
         self.config = config
-        self.settings_manager = settings_manager
+        self.settings_manager: Optional[GenericSettingsManager] = None
         self.http_client = context.http_client
         self.configman = CoreConfigManager()
-        self.extra_actions = (CustomSoftwareAction(i18n_label_key='action.reset',
-                                                   i18n_status_key='action.reset.status',
-                                                   manager_method='reset',
-                                                   manager=self,
-                                                   icon_path=resource.get_path('img/logo.svg'),
-                                                   requires_root=False,
-                                                   refresh=False),)
-        self.dynamic_extra_actions: Dict[CustomSoftwareAction, Callable[[dict], bool]] = {
-            CustomSoftwareAction(i18n_label_key='action.backups',
-                                 i18n_status_key='action.backups.status',
-                                 manager_method='launch_timeshift',
-                                 manager=self,
-                                 icon_path='timeshift',
-                                 requires_root=False,
-                                 refresh=False): self.is_backups_action_available}
+        self._action_reset: Optional[CustomSoftwareAction] = None
+        self._dynamic_extra_actions: Optional[Dict[CustomSoftwareAction, Callable[[dict], bool]]] = None
+        self.force_suggestions = force_suggestions
+
+    @property
+    def dynamic_extra_actions(self) -> Dict[CustomSoftwareAction, Callable[[dict], bool]]:
+        if self._dynamic_extra_actions is None:
+            self._dynamic_extra_actions = {
+                CustomSoftwareAction(i18n_label_key='action.backups',
+                                     i18n_status_key='action.backups.status',
+                                     i18n_description_key='action.backups.desc',
+                                     manager_method='launch_timeshift',
+                                     manager=self,
+                                     icon_path='timeshift',
+                                     requires_root=False,
+                                     refresh=False): self.is_backups_action_available
+            }
+
+        return self._dynamic_extra_actions
+
+    @property
+    def action_reset(self) -> CustomSoftwareAction:
+        if self._action_reset is None:
+            self._action_reset = CustomSoftwareAction(i18n_label_key='action.reset',
+                                                      i18n_status_key='action.reset.status',
+                                                      i18n_description_key='action.reset.desc',
+                                                      manager_method='reset',
+                                                      icon_path=resource.get_path('img/logo.svg'),
+                                                      requires_root=False,
+                                                      manager=self,
+                                                      refresh=False)
+
+        return self._action_reset
 
     def _is_timeshift_launcher_available(self) -> bool:
         return bool(shutil.which('timeshift-launcher'))
@@ -81,12 +102,12 @@ class GenericSoftwareManager(SoftwareManager):
             self._available_cache = {}
             self.working_managers.clear()
 
-    def launch_timeshift(self, root_password: str, watcher: ProcessWatcher):
+    def launch_timeshift(self, root_password: Optional[str], watcher: ProcessWatcher):
         if self._is_timeshift_launcher_available():
             try:
                 Popen(['timeshift-launcher'], stderr=STDOUT)
                 return True
-            except:
+            except Exception:
                 traceback.print_exc()
                 watcher.show_message(title=self.i18n["error"].capitalize(),
                                      body=self.i18n['action.backups.tool_error'].format(bold('Timeshift')),
@@ -97,27 +118,6 @@ class GenericSoftwareManager(SoftwareManager):
                                  body=self.i18n['action.backups.tool_error'].format(bold('Timeshift')),
                                  type_=MessageType.ERROR)
             return False
-
-    def _sort(self, apps: List[SoftwarePackage], word: str) -> List[SoftwarePackage]:
-
-        exact_name_matches, contains_name_matches, others = [], [], []
-
-        for app in apps:
-            lower_name = app.name.lower()
-
-            if word == lower_name:
-                exact_name_matches.append(app)
-            elif word in lower_name:
-                contains_name_matches.append(app)
-            else:
-                others.append(app)
-
-        res = []
-        for app_list in (exact_name_matches, contains_name_matches, others):
-            app_list.sort(key=lambda a: a.name.lower())
-            res.extend(app_list)
-
-        return res
 
     def _can_work(self, man: SoftwareManager):
         if self._available_cache is not None:
@@ -146,7 +146,7 @@ class GenericSoftwareManager(SoftwareManager):
     def _search(self, word: str, is_url: bool, man: SoftwareManager, disk_loader, res: SearchResult):
         if self._can_work(man):
             mti = time.time()
-            apps_found = man.search(words=word, disk_loader=disk_loader, is_url=is_url)
+            apps_found = man.search(words=word, disk_loader=disk_loader, is_url=is_url, limit=-1)
             mtf = time.time()
             self.logger.info(f'{man.__class__.__name__} took {mtf - mti:.8f} seconds')
 
@@ -160,28 +160,30 @@ class GenericSoftwareManager(SoftwareManager):
         res = SearchResult.empty()
 
         if self.context.is_internet_available():
-            norm_word = words.strip().lower()
+            norm_query = sanitize_command_input(words).lower()
+            self.logger.info(f"Search query: {norm_query}")
 
-            is_url = bool(RE_IS_URL.match(norm_word))
-            disk_loader = self.disk_loader_factory.new()
-            disk_loader.start()
+            if norm_query:
+                is_url = bool(RE_IS_URL.match(norm_query))
+                disk_loader = self.disk_loader_factory.new()
+                disk_loader.start()
 
-            threads = []
+                threads = []
 
-            for man in self.managers:
-                t = Thread(target=self._search, args=(norm_word, is_url, man, disk_loader, res))
-                t.start()
-                threads.append(t)
+                for man in self.managers:
+                    t = Thread(target=self._search, args=(norm_query, is_url, man, disk_loader, res))
+                    t.start()
+                    threads.append(t)
 
-            for t in threads:
-                t.join()
+                for t in threads:
+                    t.join()
 
-            if disk_loader:
-                disk_loader.stop_working()
-                disk_loader.join()
+                if disk_loader:
+                    disk_loader.stop_working()
+                    disk_loader.join()
 
-            res.installed = self._sort(res.installed, norm_word)
-            res.new = self._sort(res.new, norm_word)
+            # res.installed = self._sort(res.installed, norm_word)
+            # res.new = self._sort(res.new, norm_word)
         else:
             raise NoInternetException()
 
@@ -256,7 +258,7 @@ class GenericSoftwareManager(SoftwareManager):
                     if p.categories is None:
                         p.categories = ['updates_ignored']
                     elif 'updates_ignored' not in p.categories:
-                        p.categories.append('updates_ignored')
+                        self._add_category(p, 'updates_ignored')
 
             res.installed.sort(key=self._get_package_lower_name)
 
@@ -264,7 +266,15 @@ class GenericSoftwareManager(SoftwareManager):
         self.logger.info(f'Took {tf - ti:.2f} seconds')
         return res
 
-    def downgrade(self, app: SoftwarePackage, root_password: str, handler: ProcessWatcher) -> bool:
+    def _add_category(self, pkg: SoftwarePackage, category: str):
+        if isinstance(pkg.categories, tuple):
+            pkg.categories = tuple((*pkg.categories, category))
+        elif isinstance(pkg.categories, list):
+            pkg.categories.append(category)
+        elif isinstance(pkg.categories, set):
+            pkg.categories.add(category)
+
+    def downgrade(self, app: SoftwarePackage, root_password: Optional[str], handler: ProcessWatcher) -> bool:
         man = self._get_manager_for(app)
 
         if man and app.can_be_downgraded():
@@ -282,7 +292,7 @@ class GenericSoftwareManager(SoftwareManager):
         if man:
             return man.clean_cache_for(app)
 
-    def upgrade(self, requirements: GenericUpgradeRequirements, root_password: str, handler: ProcessWatcher) -> bool:
+    def upgrade(self, requirements: GenericUpgradeRequirements, root_password: Optional[str], handler: ProcessWatcher) -> bool:
         for man, man_reqs in requirements.sub_requirements.items():
             res = man.upgrade(man_reqs, root_password, handler)
 
@@ -307,7 +317,7 @@ class GenericSoftwareManager(SoftwareManager):
                 for p in res.removed:
                     self._fill_post_transaction_status(p, False)
 
-    def uninstall(self, pkg: SoftwarePackage, root_password: str, handler: ProcessWatcher, disk_loader: DiskCacheLoader = None) -> TransactionResult:
+    def uninstall(self, pkg: SoftwarePackage, root_password: Optional[str], handler: ProcessWatcher, disk_loader: DiskCacheLoader = None) -> TransactionResult:
         man = self._get_manager_for(pkg)
 
         if man:
@@ -321,14 +331,14 @@ class GenericSoftwareManager(SoftwareManager):
                 disk_loader.join()
                 self._update_post_transaction_status(res)
                 return res
-            except:
+            except Exception:
                 traceback.print_exc()
                 return TransactionResult(success=False, installed=[], removed=[])
             finally:
                 tf = time.time()
                 self.logger.info(f'Uninstallation of {pkg} took {(tf - ti) / 60:.2f} minutes')
 
-    def install(self, app: SoftwarePackage, root_password: str, disk_loader: DiskCacheLoader, handler: ProcessWatcher) -> TransactionResult:
+    def install(self, app: SoftwarePackage, root_password: Optional[str], disk_loader: DiskCacheLoader, handler: ProcessWatcher) -> TransactionResult:
         man = self._get_manager_for(app)
 
         if man:
@@ -342,7 +352,7 @@ class GenericSoftwareManager(SoftwareManager):
                 disk_loader.join()
                 self._update_post_transaction_status(res)
                 return res
-            except:
+            except Exception:
                 traceback.print_exc()
                 return TransactionResult(success=False, installed=[], removed=[])
             finally:
@@ -401,7 +411,7 @@ class GenericSoftwareManager(SoftwareManager):
             if man:
                 return man.requires_root(action, app)
 
-    def prepare(self, task_manager: TaskManager, root_password: str, internet_available: bool):
+    def prepare(self, task_manager: TaskManager, root_password: Optional[str], internet_available: bool):
         ti = time.time()
         self.logger.info("Initializing")
         taskman = task_manager if task_manager else TaskManager()  # empty task manager to prevent null pointers
@@ -423,6 +433,7 @@ class GenericSoftwareManager(SoftwareManager):
             for t in prepare_tasks:
                 t.join()
 
+        create_config.join()
         tf = time.time()
         self.logger.info(f'Finished ({tf - ti:.2f} seconds)')
 
@@ -482,11 +493,12 @@ class GenericSoftwareManager(SoftwareManager):
                 suggestions.extend(man_sugs)
 
     def list_suggestions(self, limit: int, filter_installed: bool) -> List[PackageSuggestion]:
-        if bool(self.config['suggestions']['enabled']):
+        if self.force_suggestions or bool(self.config['suggestions']['enabled']):
             if self.managers and self.context.is_internet_available():
                 suggestions, threads = [], []
                 for man in self.managers:
-                    t = Thread(target=self._fill_suggestions, args=(suggestions, man, int(self.config['suggestions']['by_type']), filter_installed))
+                    t = Thread(target=self._fill_suggestions,
+                               args=(suggestions, man, int(self.config['suggestions']['by_type']), filter_installed))
                     t.start()
                     threads.append(t)
 
@@ -499,7 +511,7 @@ class GenericSoftwareManager(SoftwareManager):
                 return suggestions
         return []
 
-    def execute_custom_action(self, action: CustomSoftwareAction, pkg: SoftwarePackage, root_password: str, watcher: ProcessWatcher):
+    def execute_custom_action(self, action: CustomSoftwareAction, pkg: SoftwarePackage, root_password: Optional[str], watcher: ProcessWatcher):
         if action.requires_internet and not self.context.is_internet_available():
             raise NoInternetException()
 
@@ -520,30 +532,28 @@ class GenericSoftwareManager(SoftwareManager):
             self.logger.info(f'Launching {pkg}')
             man.launch(pkg)
 
-    def get_screenshots(self, pkg: SoftwarePackage):
+    def get_screenshots(self, pkg: SoftwarePackage) -> Generator[str, None, None]:
         man = self._get_manager_for(pkg)
 
         if man:
-            return man.get_screenshots(pkg)
+            yield from man.get_screenshots(pkg)
 
     def get_working_managers(self):
         return [m for m in self.managers if self._can_work(m)]
 
-    def get_settings(self, screen_width: int, screen_height: int) -> ViewComponent:
+    def get_settings(self) -> Optional[Generator[SettingsView, None, None]]:
         if self.settings_manager is None:
             self.settings_manager = GenericSettingsManager(managers=self.managers,
                                                            working_managers=self.working_managers,
-                                                           logger=self.logger,
-                                                           i18n=self.i18n,
-                                                           file_downloader=self.context.file_downloader,
-                                                           configman=self.configman)
+                                                           configman=self.configman,
+                                                           context=self.context)
         else:
             self.settings_manager.managers = self.managers
             self.settings_manager.working_managers = self.working_managers
 
-        return self.settings_manager.get_settings(screen_width=screen_width, screen_height=screen_height)
+        yield SettingsView(self, self.settings_manager.get_settings())
 
-    def save_settings(self, component: TabGroupComponent) -> Tuple[bool, List[str]]:
+    def save_settings(self, component: TabGroupComponent) -> Tuple[bool, Optional[List[str]]]:
         return self.settings_manager.save_settings(component)
 
     def _map_pkgs_by_manager(self, pkgs: List[SoftwarePackage], pkg_filters: list = None) -> Dict[SoftwareManager, List[SoftwarePackage]]:
@@ -565,7 +575,7 @@ class GenericSoftwareManager(SoftwareManager):
 
         return by_manager
 
-    def get_upgrade_requirements(self, pkgs: List[SoftwarePackage], root_password: str, watcher: ProcessWatcher) -> UpgradeRequirements:
+    def get_upgrade_requirements(self, pkgs: List[SoftwarePackage], root_password: Optional[str], watcher: ProcessWatcher) -> UpgradeRequirements:
         by_manager = self._map_pkgs_by_manager(pkgs)
         res = GenericUpgradeRequirements([], [], [], [], {})
 
@@ -595,7 +605,7 @@ class GenericSoftwareManager(SoftwareManager):
 
         return res
 
-    def reset(self, root_password: str, watcher: ProcessWatcher) -> bool:
+    def reset(self, root_password: Optional[str], watcher: ProcessWatcher) -> bool:
         body = f"<p>{self.i18n['action.reset.body_1'].format(bold(self.context.app_name))}</p>" \
                f"<p>{self.i18n['action.reset.body_2']}</p>"
 
@@ -607,7 +617,7 @@ class GenericSoftwareManager(SoftwareManager):
             try:
                 clean_app_files(managers=self.managers, logs=False)
                 restart_app()
-            except:
+            except Exception:
                 return False
 
         return True
@@ -625,6 +635,7 @@ class GenericSoftwareManager(SoftwareManager):
 
                 for man in working_managers:
                     for action in man.gen_custom_actions():
+                        action.manager = man
                         yield action
 
         app_config = self.configman.get_config()
@@ -633,8 +644,7 @@ class GenericSoftwareManager(SoftwareManager):
             if available(app_config):
                 yield action
 
-        for action in self.extra_actions:
-            yield action
+        yield self.action_reset
 
     def _fill_sizes(self, man: SoftwareManager, pkgs: List[SoftwarePackage]):
         ti = time.time()
@@ -666,7 +676,7 @@ class GenericSoftwareManager(SoftwareManager):
                 if pkg.categories is None:
                     pkg.categories = ['updates_ignored']
                 elif 'updates_ignored' not in pkg.categories:
-                    pkg.categories.append('updates_ignored')
+                    self._add_category(pkg, 'updates_ignored')
 
     def revert_ignored_update(self, pkg: SoftwarePackage):
         manager = self._get_manager_for(pkg)
@@ -675,4 +685,7 @@ class GenericSoftwareManager(SoftwareManager):
             manager.revert_ignored_update(pkg)
 
             if not pkg.is_update_ignored() and pkg.categories and 'updates_ignored' in pkg.categories:
-                pkg.categories.remove('updates_ignored')
+                if isinstance(pkg.categories, tuple):
+                    pkg.categories = tuple(c for c in pkg.categories if c != 'updates_ignored')
+                else:
+                    pkg.categories.remove('updates_ignored')

@@ -20,8 +20,9 @@ def install(url: str, name: str, output_dir: str, electron_version: Optional[str
     if extra_options:
         cmd.extend(extra_options)
 
+    extra_env = {'XDG_CACHE_HOME': os.path.dirname(ELECTRON_CACHE_DIR)} if not os.getenv('XDG_CACHE_HOME') else None
     return SimpleProcess(cmd, cwd=cwd, extra_paths=NODE_PATHS if not system else None,
-                         extra_env={'XDG_CACHE_HOME': os.path.dirname(ELECTRON_CACHE_DIR)})
+                         extra_env=extra_env)
 
 
 def is_available() -> bool:
@@ -30,5 +31,3 @@ def is_available() -> bool:
 
 def get_version() -> str:
     return run_cmd('{} --version'.format(NATIVEFIER_BIN_PATH), print_error=False, extra_paths=NODE_PATHS)
-
-

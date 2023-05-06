@@ -2,7 +2,7 @@ import logging
 import os
 import re
 import urllib.parse
-from typing import Set, List, Iterable, Dict, Optional
+from typing import Set, List, Iterable, Dict, Optional, Generator, Tuple
 
 import requests
 
@@ -112,12 +112,70 @@ class AURClient:
     def search(self, words: str) -> dict:
         return self.http_client.get_json(URL_SEARCH + words)
 
-    def get_info(self, names: Iterable[str]) -> List[dict]:
-        try:
-            res = self.http_client.get_json(URL_INFO + self._map_names_as_queries(names))
-            return res['results'] if res and res.get('results') else []
-        except:
-            return []
+    def get_info(self, names: Iterable[str]) -> Optional[List[dict]]:
+        if names:
+            try:
+                res = self.http_client.get_json(URL_INFO + self._map_names_as_queries(names))
+            except requests.exceptions.ConnectionError:
+                self.logger.warning('Could not retrieve installed AUR packages API data. It seems the internet connection is off.')
+                return
+
+            if res is None:
+                self.logger.warning("Call to AUR API's info endpoint has failed")
+                return
+
+            error = res.get('error')
+
+            if error:
+                self.logger.warning(f"AUR API's info endpoint returned an unexpected error: {error}")
+                return
+
+            results = res.get('results')
+
+            if results is not None:
+                return results
+
+            self.logger.warning(f"AUR API's info endpoint returned an unexpected response: {res}")
+
+    def map_provided(self, pkgname: str, pkgver: str, provided: Optional[Iterable[str]] = None, strip_epoch: bool = True) -> Set[str]:
+        all_provided = {pkgname, f"{pkgname}={pkgver.split('-')[0] if strip_epoch else pkgver}"}
+
+        if provided:
+            for provided in provided:
+                all_provided.add(provided)
+                all_provided.add(provided.split('=', 1)[0])
+
+        return all_provided
+
+    def gen_updates_data(self, names: Iterable[str]) -> Generator[Tuple[str, dict], None, None]:
+        pkgs_info = self.get_info(names)
+
+        if pkgs_info:
+            for package in pkgs_info:
+                pkgname, pkgver = package['Name'], package['Version'].split('-')[0]
+
+                deps = set()
+
+                for dtype in ('Depends', 'MakeDepends', 'CheckDepends'):
+                    dep_set = package.get(dtype)
+                    if dep_set:
+                        deps.update(dep_set)
+
+                conflicts = set()
+                pkg_conflicts = package.get('Conflicts')
+
+                if pkg_conflicts:
+                    conflicts.update(pkg_conflicts)
+
+                yield pkgname, {
+                    'v': pkgver,
+                    'b': package.get('PackageBase', pkgname),
+                    'r': 'aur',
+                    'p': self.map_provided(pkgname=pkgname, pkgver=pkgver, provided=package.get('Provides'), strip_epoch=False),
+                    'd': deps,
+                    'c': conflicts,
+                    'ds': None,
+                    's': None}
 
     def get_src_info(self, name: str, real_name: Optional[str] = None) -> dict:
         srcinfo = self.srcinfo_cache.get(name)
@@ -138,7 +196,7 @@ class AURClient:
         self.logger.warning('No .SRCINFO found for {}'.format(name))
         self.logger.info('Checking if {} is based on another package'.format(name))
         # if was not found, it may be based on another package.
-        infos = self.get_info({name})
+        infos = self.get_info((name,))
 
         if infos:
             info = infos[0]
@@ -177,8 +235,8 @@ class AURClient:
 
         return self.extract_required_dependencies(info)
 
-    def _map_names_as_queries(self, names) -> str:
-        return '&'.join(['arg[{}]={}'.format(i, urllib.parse.quote(n)) for i, n in enumerate(names)])
+    def _map_names_as_queries(self, names: Iterable[str]) -> str:
+        return '&'.join((f'arg[]={urllib.parse.quote(n)}' for n in names))
 
     def read_local_index(self) -> dict:
         self.logger.info('Checking if the cached AUR index file exists')
@@ -223,20 +281,20 @@ class AURClient:
                     return set()
             else:
                 return index.values()
-        except:
+        except Exception:
             return set()
 
     def clean_caches(self):
         self.srcinfo_cache.clear()
 
-    def map_update_data(self, pkgname: str, latest_version: Optional[str], srcinfo: Optional[dict] = None) -> dict:
+    def map_update_data(self, pkgname: str, latest_version: Optional[str] = None, srcinfo: Optional[dict] = None) -> dict:
         info = self.get_src_info(pkgname) if not srcinfo else srcinfo
 
         provided = set()
         provided.add(pkgname)
 
         if info:
-            provided.add('{}={}'.format(pkgname, info['pkgver']))
+            provided.add(f"{pkgname}={info['pkgver']}")
             if info.get('provides'):
                 provided.update(info.get('provides'))
 
@@ -245,7 +303,7 @@ class AURClient:
                     'b': info.get('pkgbase', pkgname)}
         else:
             if latest_version:
-                provided.add('{}={}'.format(pkgname, latest_version))
+                provided.add(f'{pkgname}={latest_version}')
 
             return {'c': None, 's': None, 'p': provided, 'r': 'aur', 'v': latest_version, 'd': set(), 'b': pkgname}
 
@@ -256,4 +314,3 @@ class AURClient:
 
 def is_supported(arch_config: dict) -> bool:
     return arch_config['aur'] and git.is_installed()
-

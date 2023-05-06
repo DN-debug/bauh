@@ -4,7 +4,7 @@ import shutil
 from abc import ABC, abstractmethod
 from enum import Enum
 from pathlib import Path
-from typing import List, Set, Type, Tuple, Optional, Generator
+from typing import List, Set, Type, Tuple, Optional, Generator, TypeVar
 
 import yaml
 
@@ -15,10 +15,12 @@ from bauh.api.abstract.model import SoftwarePackage, PackageUpdate, PackageHisto
     CustomSoftwareAction
 from bauh.api.abstract.view import ViewComponent
 
+P = TypeVar('P', bound=SoftwarePackage)
+
 
 class SearchResult:
 
-    def __init__(self, installed: Optional[List[SoftwarePackage]], new: Optional[List[SoftwarePackage]], total: int):
+    def __init__(self, installed: Optional[List[P]], new: Optional[List[P]], total: int):
         """
         :param installed: already installed packages
         :param new: new packages found
@@ -40,13 +42,23 @@ class SearchResult:
         self.total = total
 
     @classmethod
-    def empty(cls):
+    def empty(cls) -> "SearchResult":
         return cls(installed=[], new=[], total=0)
+
+    def __eq__(self, other):
+        if isinstance(other, SearchResult):
+            if self.installed == other.installed:
+                return self.new == other.new
+
+        return False
+
+    def __hash__(self):
+        return hash(self.installed) + hash(self.new)
 
 
 class UpgradeRequirement:
 
-    def __init__(self, pkg: SoftwarePackage, reason: str = None, required_size: int = None, extra_size: int = None, sorting_priority: int = 0):
+    def __init__(self, pkg: SoftwarePackage, reason: Optional[str] = None, required_size: Optional[float] = None, extra_size: Optional[float] = None, sorting_priority: int = 0):
         """
 
         :param pkg:
@@ -65,11 +77,20 @@ class UpgradeRequirement:
     def sort_by_priority(req: "UpgradeRequirement") -> Tuple[int, str]:
         return -req.sorting_priority, req.pkg.name
 
+    def __eq__(self, other) -> bool:
+        if isinstance(other, UpgradeRequirement):
+            return self.__dict__ == other.__dict__
+
+        return False
+
+    def __hash__(self) -> int:
+        return sum((hash(k) + hash(v) for k, v in self.__dict__.items()))
+
 
 class UpgradeRequirements:
 
     def __init__(self, to_install: Optional[List[UpgradeRequirement]], to_remove: Optional[List[UpgradeRequirement]],
-                 to_upgrade: List[UpgradeRequirement], cannot_upgrade: Optional[List[UpgradeRequirement]]):
+                 to_upgrade: Optional[List[UpgradeRequirement]], cannot_upgrade: Optional[List[UpgradeRequirement]]):
         """
         :param to_install: additional packages that must be installed with the upgrade
         :param to_remove: non upgrading packages that should be removed due to conflicts with upgrading packages
@@ -105,6 +126,29 @@ class SoftwareAction(Enum):
     UNINSTALL = 3
     UPGRADE = 4
     DOWNGRADE = 5
+
+
+class SettingsController(ABC):
+
+    def save_settings(self, component: ViewComponent) -> Tuple[bool, Optional[List[str]]]:
+        """
+        :return: a tuple with a bool informing if the settings were saved and a list of error messages
+        """
+        pass
+
+
+class SettingsView:
+
+    def __init__(self, controller: SettingsController, component: ViewComponent, label: Optional[str] = None,
+                 icon_path: Optional[str] = None):
+
+        self.controller = controller
+        self.component = component
+        self.label = label
+        self.icon_path = icon_path
+
+    def save(self) -> Tuple[bool, Optional[List[str]]]:
+        return self.controller.save_settings(self.component)
 
 
 class SoftwareManager(ABC):
@@ -143,7 +187,7 @@ class SoftwareManager(ABC):
         pass
 
     @abstractmethod
-    def downgrade(self, pkg: SoftwarePackage, root_password: str, handler: ProcessWatcher) -> bool:
+    def downgrade(self, pkg: SoftwarePackage, root_password: Optional[str], handler: ProcessWatcher) -> bool:
         """
         downgrades a package version
         :param pkg:
@@ -162,7 +206,7 @@ class SoftwareManager(ABC):
         if pkg.supports_disk_cache() and os.path.exists(pkg.get_disk_cache_path()):
             shutil.rmtree(pkg.get_disk_cache_path())
 
-    def get_upgrade_requirements(self, pkgs: List[SoftwarePackage], root_password: str, watcher: ProcessWatcher) -> UpgradeRequirements:
+    def get_upgrade_requirements(self, pkgs: List[SoftwarePackage], root_password: Optional[str], watcher: ProcessWatcher) -> UpgradeRequirements:
         """
         return additional required software that needs to be installed / removed / updated before updating a list of packages
         :param pkgs:
@@ -172,7 +216,7 @@ class SoftwareManager(ABC):
         return UpgradeRequirements(None, None, [UpgradeRequirement(p) for p in pkgs], None)
 
     @abstractmethod
-    def upgrade(self, requirements: UpgradeRequirements, root_password: str, watcher: ProcessWatcher) -> bool:
+    def upgrade(self, requirements: UpgradeRequirements, root_password: Optional[str], watcher: ProcessWatcher) -> bool:
         """
         :param requirements:
         :param root_password: the root user password (if required)
@@ -182,7 +226,7 @@ class SoftwareManager(ABC):
         pass
 
     @abstractmethod
-    def uninstall(self, pkg: SoftwarePackage, root_password: str, watcher: ProcessWatcher, disk_loader: Optional[DiskCacheLoader]) -> TransactionResult:
+    def uninstall(self, pkg: SoftwarePackage, root_password: Optional[str], watcher: ProcessWatcher, disk_loader: Optional[DiskCacheLoader]) -> TransactionResult:
         """
         :param pkg:
         :param root_password: the root user password (if required)
@@ -217,7 +261,7 @@ class SoftwareManager(ABC):
         pass
 
     @abstractmethod
-    def install(self, pkg: SoftwarePackage, root_password: str, disk_loader: Optional[DiskCacheLoader], watcher: ProcessWatcher) -> TransactionResult:
+    def install(self, pkg: SoftwarePackage, root_password: Optional[str], disk_loader: Optional[DiskCacheLoader], watcher: ProcessWatcher) -> TransactionResult:
         """
         :param pkg:
         :param root_password: the root user password (if required)
@@ -325,8 +369,7 @@ class SoftwareManager(ABC):
         """
         pass
 
-    @abstractmethod
-    def list_suggestions(self, limit: int, filter_installed: bool) -> List[PackageSuggestion]:
+    def list_suggestions(self, limit: int, filter_installed: bool) -> Optional[List[PackageSuggestion]]:
         """
         :param limit: max suggestions to be returned. If limit < 0, it should not be considered
         :param filter_installed: if the installed suggestions should not be retrieved
@@ -334,7 +377,7 @@ class SoftwareManager(ABC):
         """
         pass
 
-    def execute_custom_action(self, action: CustomSoftwareAction, pkg: SoftwarePackage, root_password: str, watcher: ProcessWatcher) -> bool:
+    def execute_custom_action(self, action: CustomSoftwareAction, pkg: SoftwarePackage, root_password: Optional[str], watcher: ProcessWatcher) -> bool:
         """
         At the moment the GUI implements this action. No need to implement it yourself.
         :param action:
@@ -355,10 +398,9 @@ class SoftwareManager(ABC):
     def launch(self, pkg: SoftwarePackage):
         pass
 
-    @abstractmethod
-    def get_screenshots(self, pkg: SoftwarePackage) -> List[str]:
+    def get_screenshots(self, pkg: SoftwarePackage) -> Generator[str, None, None]:
         """
-        :return: screenshot urls for the given package
+        :return: yields screenshot urls for the given package
         """
         pass
 
@@ -368,17 +410,9 @@ class SoftwareManager(ABC):
         """
         pass
 
-    def get_settings(self, screen_width: int, screen_height: int) -> Optional[ViewComponent]:
+    def get_settings(self) -> Optional[Generator[SettingsView, None, None]]:
         """
-        :param screen_width
-        :param screen_height
-        :return: a form abstraction with all available settings
-        """
-        pass
-
-    def save_settings(self, component: ViewComponent) -> Tuple[bool, Optional[List[str]]]:
-        """
-        :return: a tuple with a bool informing if the settings were saved and a list of error messages
+        :return: panel abstractions with optional icon paths associated with
         """
         pass
 

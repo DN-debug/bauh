@@ -7,6 +7,7 @@ import requests
 import yaml
 
 from bauh.commons import system
+from bauh.commons.view_utils import get_human_size_str
 
 
 class HttpClient:
@@ -95,14 +96,14 @@ class HttpClient:
             if size:
                 try:
                     return int(size)
-                except:
+                except Exception:
                     pass
 
     def get_content_length(self, url: str, session: bool = True) -> Optional[str]:
         size = self.get_content_length_in_bytes(url, session)
 
         if size:
-            return system.get_human_size_str(size)
+            return get_human_size_str(size)
 
     def exists(self, url: str, session: bool = True, timeout: int = 5) -> bool:
         params = {'url': url, 'allow_redirects': True, 'verify': False, 'timeout': timeout}

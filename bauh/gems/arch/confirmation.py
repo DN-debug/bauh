@@ -1,11 +1,12 @@
-from typing import Set, List, Tuple, Dict, Optional
+from io import StringIO
+from typing import Set, Tuple, Dict, Collection
 
 from bauh.api.abstract.handler import ProcessWatcher
 from bauh.api.abstract.view import MultipleSelectComponent, InputOption, FormComponent, SingleSelectComponent, \
     SelectViewType
 from bauh.commons import resource
 from bauh.commons.html import bold
-from bauh.commons.system import get_human_size_str
+from bauh.commons.view_utils import get_human_size_str
 from bauh.gems.arch import ROOT_DIR, get_repo_icon_path, get_icon_path, pacman
 from bauh.view.util.translation import I18n
 
@@ -22,11 +23,9 @@ def request_optional_deps(pkgname: str, pkg_repos: dict, watcher: ProcessWatcher
 
     for p, d in pkg_repos.items():
         size = sizes.get(p)
-        op = InputOption('{}{} ({}: {}) - {}: {}'.format(p, ': ' + d['desc'] if d['desc'] else '',
-                                                         i18n['repository'],
-                                                         d['repository'].lower(),
-                                                         i18n['size'].capitalize(),
-                                                         get_human_size_str(size) if size else '?'), p)
+        label = f"{p} ({i18n['repository']}: {d['repository'].lower()}) | " \
+                f"{i18n['size'].capitalize()}: {get_human_size_str(size) if size is not None else '?'}"
+        op = InputOption(label=label, value=p, tooltip=d.get('desc') or None)
         op.icon_path = _get_repo_icon(d['repository'])
         opts.append(op)
 
@@ -34,37 +33,80 @@ def request_optional_deps(pkgname: str, pkg_repos: dict, watcher: ProcessWatcher
                                         options=opts,
                                         default_options=set(opts))
 
+    msg = f"<p>{i18n['arch.install.optdeps.request.success'].format(pkg=bold(pkgname))}</p>" \
+          f"<p>{i18n['arch.install.optdeps.request.body']}:</p>"
+
     install = watcher.request_confirmation(title=i18n['arch.install.optdeps.request.title'],
-                                           body='<p>{}.</p><p>{}:</p>'.format(i18n['arch.install.optdeps.request.body'].format(bold(pkgname)), i18n['arch.install.optdeps.request.help']),
+                                           body=msg,
                                            components=[view_opts],
                                            confirmation_label=i18n['install'].capitalize(),
-                                           deny_label=i18n['do_not.install'].capitalize())
+                                           deny_label=i18n['do_not.install'].capitalize(),
+                                           min_width=600,
+                                           min_height=200)
 
     if install:
         return {o.value for o in view_opts.values}
 
 
-def request_install_missing_deps(pkgname: Optional[str], deps: List[Tuple[str, str]], watcher: ProcessWatcher, i18n: I18n) -> bool:
-    msg = '<p>{}</p>'.format(i18n['arch.missing_deps.body'].format(name=bold(pkgname) if pkgname else '', deps=bold(str(len(deps)))))
-
+def confirm_missing_deps(deps: Collection[Tuple[str, str]], watcher: ProcessWatcher, i18n: I18n) -> bool:
     opts = []
 
-    repo_deps = [d[0] for d in deps if d[1] != 'aur']
-    sizes = pacman.map_update_sizes(repo_deps) if repo_deps else {}
+    total_isize, total_dsize = None, None
+    pkgs_data = pacman.map_updates_data(pkgs=tuple(d[0] for d in deps if d[1] != 'aur'), description=True) or dict()
 
     for dep in deps:
-        size = sizes.get(dep[0])
-        op = InputOption('{} ({}: {}) - {}: {}'.format(dep[0],
-                                                       i18n['repository'],
-                                                       dep[1].lower(),
-                                                       i18n['size'].capitalize(),
-                                                       get_human_size_str(size) if size else '?'), dep[0])
+        ver, desc, isize, dsize = None, None, None, None
+        data = pkgs_data.get(dep[0])
+
+        if data:
+            desc, isize, dsize = (data.get(f) for f in ('des', 's', 'ds'))
+
+            if isize is not None:
+                if total_isize is None:
+                    total_isize = 0
+
+                total_isize += isize
+
+            if dsize is not None:
+                if total_dsize is None:
+                    total_dsize = 0
+
+                total_dsize += dsize
+
+        label = f"{dep[0]} | " \
+                f"{i18n['size'].capitalize()}: {get_human_size_str(isize) if isize is not None else '?'}" \
+                f"{' ({}: {})'.format(i18n['download'].capitalize(), get_human_size_str(dsize)) if dsize else ''}"
+
+        op = InputOption(label=label, value=dep[0], tooltip=desc)
         op.read_only = True
         op.icon_path = _get_repo_icon(dep[1])
         opts.append(op)
 
     comp = MultipleSelectComponent(label='', options=opts, default_options=set(opts))
-    return watcher.request_confirmation(i18n['arch.missing_deps.title'], msg, [comp], confirmation_label=i18n['continue'].capitalize(), deny_label=i18n['cancel'].capitalize())
+
+    body = StringIO()
+    body.write('<p>')
+    body.write(i18n['arch.missing_deps.body'].format(deps=bold(str(len(deps)))))
+
+    if total_isize is not None or total_dsize is not None:
+        body.write(' (')
+
+        if total_isize is not None:
+            body.write(f"{i18n['size'].capitalize()}: {bold(get_human_size_str(total_isize))} | ")
+
+        if total_dsize is not None:
+            body.write(f"{i18n['download'].capitalize()}: {bold(get_human_size_str(total_dsize))}")
+
+        body.write(')')
+
+    body.write(':</p>')
+
+    return watcher.request_confirmation(title=i18n['arch.missing_deps.title'],
+                                        body=body.getvalue(),
+                                        components=[comp],
+                                        confirmation_label=i18n['continue'].capitalize(),
+                                        deny_label=i18n['cancel'].capitalize(),
+                                        min_width=625)
 
 
 def request_providers(providers_map: Dict[str, Set[str]], repo_map: Dict[str, str], watcher: ProcessWatcher, i18n: I18n) -> Set[str]:
@@ -79,15 +121,22 @@ def request_providers(providers_map: Dict[str, Set[str]], repo_map: Dict[str, st
     for dep, providers in providers_map.items():
         opts = []
 
-        providers_list = [*providers]
-        providers_list.sort()
+        repo_providers, aur_providers = {}, {}
 
-        for p in providers_list:
+        for p in providers:
             repo = repo_map.get(p, 'aur')
-            opts.append(InputOption(label=p,
-                                    value=p,
-                                    icon_path=aur_icon_path if repo == 'aur' else repo_icon_path,
-                                    tooltip='{}: {}'.format(i18n['repository'].capitalize(), repo)))
+
+            if repo == 'aur':
+                aur_providers[p] = repo
+            else:
+                repo_providers[p] = repo
+
+        for current_providers in (repo_providers, aur_providers):
+            for pname, repo in sorted(current_providers.items()):
+                opts.append(InputOption(label=pname,
+                                        value=pname,
+                                        icon_path=aur_icon_path if repo == 'aur' else repo_icon_path,
+                                        tooltip='{}: {}'.format(i18n['repository'].capitalize(), repo)))
 
         form.components.append(SingleSelectComponent(label=bold(dep.lower()),
                                                      options=opts,
